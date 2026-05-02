@@ -37,8 +37,13 @@ mut:
 	usec i64
 }
 
+__global window = 100
 __global g_dns = ''
 __global g_workers = 4
+
+fn get_ts() i64 {
+	return time.now().second / window
+}
 
 fn char_idx(ch u8) int {
 	if ch == ` ` {
@@ -221,21 +226,16 @@ fn die(s string) {
 }
 
 fn send_byte(base string, byte_idx int, ch u8) {
+	ts := get_ts()
 	for bit in 0 .. 8 {
 		idx := byte_idx * 8 + bit
 		b := u8((ch >> (7 - bit)) & 1)
 		if b == 0 {
-			resolve('${idx}.${base}') or { return }
-			time.sleep(50 * time.millisecond)
-			resolve('${idx}.${base}') or {}
-			time.sleep(50 * time.millisecond)
-			resolve('v${idx}.${base}') or { return }
-			time.sleep(50 * time.millisecond)
-			resolve('v${idx}.${base}') or {}
-			time.sleep(50 * time.millisecond)
-			resolve('w${idx}.${base}') or { return }
-			time.sleep(50 * time.millisecond)
-			resolve('w${idx}.${base}') or {}
+			for _ in 0 .. 5 {
+				resolve('${ts}.${idx}.${base}') or {}
+				resolve('${ts}.v${idx}.${base}') or {}
+				resolve('${ts}.w${idx}.${base}') or {}
+			}
 		}
 	}
 }
@@ -249,7 +249,8 @@ fn send_mode(base string, msg string) {
 
 	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
 	println('[tx] ${data.len} wire bytes (huffman)')
-	println('[tx] receiver cmd:  dnsh --dns ${g_dns} rec ${base} ${data.len}')
+	if g_dns == "" { println('[tx] receiver cmd:  dnsh rec ${base} ${data.len}') }
+	else { println('[tx] receiver cmd:  dnsh --dns ${g_dns} rec ${base} ${data.len}') }
 	println('[tx] sending with ${g_workers} workers...')
 
 	mut pos := 0
@@ -280,9 +281,10 @@ fn send_mode(base string, msg string) {
 
 	println('[tx] cached ${zeros} subdomains')
 	println('[tx] keepalive running... (ctrl+c to stop)\n')
-
+	
 	mut round := 0
 	for {
+		ts := get_ts()
 		round++
 		mut refreshed := 0
 		for i in 0 .. data.len {
@@ -290,11 +292,11 @@ fn send_mode(base string, msg string) {
 			for bit in 0 .. 8 {
 				idx := i * 8 + bit
 				if ((ch >> (7 - bit)) & 1) == 0 {
-					resolve('${idx}.${base}') or {}
+					resolve('${ts}.${idx}.${base}') or {}
 					time.sleep(100 * time.millisecond)
-					resolve('v${idx}.${base}') or {}
+					resolve('${ts}.v${idx}.${base}') or {}
 					time.sleep(100 * time.millisecond)
-					resolve('w${idx}.${base}') or {}
+					resolve('${ts}.w${idx}.${base}') or {}
 					time.sleep(100 * time.millisecond)
 					refreshed++
 				}
@@ -355,14 +357,15 @@ fn rec_mode(base string, nbytes int) {
 	for i in 0 .. nbytes {
 		mut ch := u8(0)
 		mut ts := []i64{}
-
+		tsd := get_ts()
+		
 		for _ in 0 .. 8 {
 			time.sleep(100 * time.millisecond)
-			t1 := resolve_safe('${bit_idx}.${base}')
+			t1 := resolve_safe('${tsd}.${bit_idx}.${base}')
 			time.sleep(200 * time.millisecond)
-			t2 := resolve_safe('v${bit_idx}.${base}')
+			t2 := resolve_safe('${tsd}.v${bit_idx}.${base}')
 			time.sleep(300 * time.millisecond)
-			t3 := resolve_safe('w${bit_idx}.${base}')
+			t3 := resolve_safe('${tsd}.w${bit_idx}.${base}')
 
 			mut t := t1
 			if t2 >= 0 && (t < 0 || t2 < t) {
@@ -381,6 +384,10 @@ fn rec_mode(base string, nbytes int) {
 		}
 
 		out << ch
+		if ch.hex() == "ff" {
+			bit_idx += nbytes
+			unsafe { i = 0 }
+		}
 		println('  byte #${i}  ${ts}ms  ->  0x${ch.hex()}')
 	}
 
@@ -400,6 +407,9 @@ fn main() {
 			if g_workers < 1 {
 				g_workers = 1
 			}
+			i += 2
+    } else if os.args[i] == '--window' && i + 1 < os.args.len {
+			window = os.args[i + 1].int()
 			i += 2
 		} else {
 			args << os.args[i]
