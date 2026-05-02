@@ -96,6 +96,7 @@ The byte count argument must match the length of the sent message. The receiver 
 |------|-------------|
 | `--dns SERVER` | Use a specific DNS resolver IP instead of the system default |
 | `--workers N` | Number of parallel threads for sending (default: 4). Only affects send mode. Receive is always sequential to preserve timing accuracy. |
+| `--window TIME` | The time of changing the domain to refresh everything cached (default: 100s). |
 
 ---
 

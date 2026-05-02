@@ -422,7 +422,7 @@ fn main() {
 	}
 
 	if args.len < 1 {
-		eprintln('dnsh [--dns SERVER] [--workers N] <send|rec> [domain] [msg|bytes]')
+		eprintln('dnsh [--dns SERVER] [--workers N] [--window TIME] <send|rec> [domain] [msg|bytes]')
 		eprintln('  dnsh --dns 8.8.8.8 send x.com "hello world"')
 		eprintln('  dnsh --dns 8.8.8.8 rec  x.com 7')
 		exit(1)
