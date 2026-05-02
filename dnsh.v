@@ -232,9 +232,9 @@ fn send_byte(base string, byte_idx int, ch u8) {
 		b := u8((ch >> (7 - bit)) & 1)
 		if b == 0 {
 			for _ in 0 .. 5 {
-				resolve('${ts}.${idx}.${base}') or {}
-				resolve('${ts}.v${idx}.${base}') or {}
-				resolve('${ts}.w${idx}.${base}') or {}
+				resolve('${idx}.${ts}${base}') or {}
+				resolve('v${idx}.${ts}${base}') or {}
+				resolve('w${idx}.${ts}${base}') or {}
 			}
 		}
 	}
@@ -292,11 +292,11 @@ fn send_mode(base string, msg string) {
 			for bit in 0 .. 8 {
 				idx := i * 8 + bit
 				if ((ch >> (7 - bit)) & 1) == 0 {
-					resolve('${ts}.${idx}.${base}') or {}
+					resolve('${idx}.${ts}${base}') or {}
 					time.sleep(100 * time.millisecond)
-					resolve('${ts}.v${idx}.${base}') or {}
+					resolve('v${idx}.${ts}${base}') or {}
 					time.sleep(100 * time.millisecond)
-					resolve('${ts}.w${idx}.${base}') or {}
+					resolve('w${idx}.${ts}${base}') or {}
 					time.sleep(100 * time.millisecond)
 					refreshed++
 				}
@@ -422,7 +422,7 @@ fn main() {
 	}
 
 	if args.len < 1 {
-		eprintln('dnsh [--dns SERVER] [--workers N] [--window TIME] <send|rec> [domain] [msg|bytes]')
+		eprintln('dnsh [--dns SERVER] [--workers N] [--window SEC] <send|rec> [domain] [msg|bytes]')
 		eprintln('  dnsh --dns 8.8.8.8 send x.com "hello world"')
 		eprintln('  dnsh --dns 8.8.8.8 rec  x.com 7')
 		exit(1)
