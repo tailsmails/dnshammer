@@ -323,7 +323,7 @@ fn rec_mode(base string, nbytes int) {
 		time.sleep(100 * time.millisecond)
 	}
 	for _ in 0 .. 7 {
-		s := resolve_safe('u${rand.intn(99999) or { 0 }}.${base}')
+		s := resolve_safe('u${rand.intn(99999) or { panic("failed to generate random number") }}.${base}')
 		if s >= 0 {
 			slow_arr << s
 		}
@@ -344,7 +344,7 @@ fn rec_mode(base string, nbytes int) {
 		die('gap ${gap}ms too small (fast:${fast_med} slow:${slow_med}) - sender running?')
 	}
 
-	mut thr := (fast_med + slow_med) / 2
+	mut thr := ((fast_med + slow_med + gap) / 3) - 5
 	if thr < 10 {
 		thr = 10
 	}
