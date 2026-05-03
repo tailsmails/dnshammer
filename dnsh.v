@@ -42,7 +42,7 @@ __global g_dns = ''
 __global g_workers = 4
 
 fn get_ts() i64 {
-	return time.now().second / window
+	return time.now().unix() / window
 }
 
 fn char_idx(ch u8) int {
