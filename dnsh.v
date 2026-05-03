@@ -361,11 +361,11 @@ fn rec_mode(base string, nbytes int) {
 		
 		for _ in 0 .. 8 {
 			time.sleep(100 * time.millisecond)
-			t1 := resolve_safe('${tsd}${bit_idx}${base}')
+			t1 := resolve_safe('${bit_idx}${tsd}${base}')
 			time.sleep(200 * time.millisecond)
-			t2 := resolve_safe('${tsd}v${bit_idx}${base}')
+			t2 := resolve_safe('v${bit_idx}${tsd}${base}')
 			time.sleep(300 * time.millisecond)
-			t3 := resolve_safe('${tsd}w${bit_idx}${base}')
+			t3 := resolve_safe('w${bit_idx}${tsd}${base}')
 
 			mut t := t1
 			if t2 >= 0 && (t < 0 || t2 < t) {
