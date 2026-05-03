@@ -232,9 +232,9 @@ fn send_byte(base string, byte_idx int, ch u8) {
 		b := u8((ch >> (7 - bit)) & 1)
 		if b == 0 {
 			for _ in 0 .. 5 {
-				resolve('${idx}.${ts}${base}') or {}
-				resolve('v${idx}.${ts}${base}') or {}
-				resolve('w${idx}.${ts}${base}') or {}
+				resolve('${idx}${ts}${base}') or {}
+				resolve('v${idx}${ts}${base}') or {}
+				resolve('w${idx}${ts}${base}') or {}
 			}
 		}
 	}
@@ -292,11 +292,11 @@ fn send_mode(base string, msg string) {
 			for bit in 0 .. 8 {
 				idx := i * 8 + bit
 				if ((ch >> (7 - bit)) & 1) == 0 {
-					resolve('${idx}.${ts}${base}') or {}
+					resolve('${idx}${ts}${base}') or {}
 					time.sleep(100 * time.millisecond)
-					resolve('v${idx}.${ts}${base}') or {}
+					resolve('v${idx}${ts}${base}') or {}
 					time.sleep(100 * time.millisecond)
-					resolve('w${idx}.${ts}${base}') or {}
+					resolve('w${idx}${ts}${base}') or {}
 					time.sleep(100 * time.millisecond)
 					refreshed++
 				}
@@ -361,11 +361,11 @@ fn rec_mode(base string, nbytes int) {
 		
 		for _ in 0 .. 8 {
 			time.sleep(100 * time.millisecond)
-			t1 := resolve_safe('${tsd}.${bit_idx}.${base}')
+			t1 := resolve_safe('${tsd}${bit_idx}${base}')
 			time.sleep(200 * time.millisecond)
-			t2 := resolve_safe('${tsd}.v${bit_idx}.${base}')
+			t2 := resolve_safe('${tsd}v${bit_idx}${base}')
 			time.sleep(300 * time.millisecond)
-			t3 := resolve_safe('${tsd}.w${bit_idx}.${base}')
+			t3 := resolve_safe('${tsd}w${bit_idx}${base}')
 
 			mut t := t1
 			if t2 >= 0 && (t < 0 || t2 < t) {
