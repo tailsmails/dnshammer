@@ -42,6 +42,11 @@ mut:
 
 __global g_dns = ''
 __global g_workers = 4
+__global window = 100
+
+fn get_ts() i64 {
+	return time.now().unix() / window
+}
 
 fn char_idx(ch u8) int {
 	if ch == ` ` { return 0 }
@@ -340,14 +345,15 @@ fn die(s string) {
 }
 
 fn send_byte(base string, byte_idx int, ch u8) {
+	ts := get_ts()
 	for bit in 0 .. 8 {
 		idx := byte_idx * 8 + bit
 		b := u8((ch >> (7 - bit)) & 1)
 		if b == 0 {
 			for _ in 0 .. 5 {
-				resolve('${idx}.${base}') or {}
-				resolve('v${idx}.${base}') or {}
-				resolve('w${idx}.${base}') or {}
+				resolve('${idx}${ts}.${base}') or {}
+				resolve('v${idx}${ts}.${base}') or {}
+				resolve('w${idx}${ts}.${base}') or {}
 			}
 		}
 	}
@@ -391,6 +397,7 @@ fn send_mode(base string, msg string) {
 	
 	mut round := 0
 	for {
+		ts := get_ts()
 		round++
 		mut refreshed := 0
 		for i in 0 .. data.len {
@@ -398,11 +405,11 @@ fn send_mode(base string, msg string) {
 			for bit in 0 .. 8 {
 				idx := i * 8 + bit
 				if ((ch >> (7 - bit)) & 1) == 0 {
-					resolve('${idx}.${base}') or {}
+					resolve('${idx}${ts}.${base}') or {}
 					time.sleep(20 * time.millisecond)
-					resolve('v${idx}.${base}') or {}
+					resolve('v${idx}${ts}.${base}') or {}
 					time.sleep(20 * time.millisecond)
-					resolve('w${idx}.${base}') or {}
+					resolve('w${idx}${ts}.${base}') or {}
 					time.sleep(20 * time.millisecond)
 					refreshed++
 				}
@@ -450,6 +457,7 @@ fn rec_mode(base string, nbytes int) {
 
 	mut out :=[]u8{}
 	mut bit_idx := 0
+	ts := get_ts()
 
 	for i in 0 .. nbytes {
 		mut ch := u8(0)
@@ -457,9 +465,9 @@ fn rec_mode(base string, nbytes int) {
 		
 		for _ in 0 .. 8 {
 			time.sleep(10 * time.millisecond)
-			t1 := resolve_safe('${bit_idx}.${base}')
-			t2 := resolve_safe('v${bit_idx}.${base}')
-			t3 := resolve_safe('w${bit_idx}.${base}')
+			t1 := resolve_safe('${bit_idx}${ts}.${base}')
+			t2 := resolve_safe('v${bit_idx}${ts}.${base}')
+			t3 := resolve_safe('w${bit_idx}${ts}.${base}')
 
 			mut t := t1
 			if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
@@ -493,6 +501,10 @@ fn main() {
 		} else if os.args[i] == '--workers' && i + 1 < os.args.len {
 			g_workers = os.args[i + 1].int()
 			if g_workers < 1 { g_workers = 1 }
+			i += 2
+		} else if os.args[i] == '--window' && i + 1 < os.args.len {
+			window = os.args[i + 1].int()
+			if window < 1 { window = 1 }
 			i += 2
 		} else {
 			args << os.args[i]
