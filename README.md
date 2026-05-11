@@ -83,6 +83,18 @@ With a specific DNS server:
 ./dnsh --dns 8.8.8.8 rec example.com 5
 ```
 
+### SOCKS Proxy Mode
+
+Start the server (receiver side):
+```
+./dnsh --dns 8.8.8.8 socks server example.com
+```
+
+Start the client (sender side):
+```
+./dnsh --dns 8.8.8.8 socks client example.com 1080
+```
+
 The byte count argument must match the length of the sent message. The receiver will:
 - Calibrate by measuring cached vs uncached response times
 - Read each bit sequentially and reconstruct the bytes
