@@ -42,13 +42,26 @@ mut:
 }
 
 __global g_dns = ''
-__global g_workers = 256
-__global window = 100
+__global g_workers = 1024
+__global g_thr = i64(3000)
 
 fn get_ts() i64 {
-	// We use a shorter window for high-speed transmission.
-	// 100ms slots allow for ~10 bits per second per worker.
-	return time.now().unix_milli() / 100
+	return time.now().unix_milli() / 250
+}
+
+fn crc8(data []u8) u8 {
+	mut crc := u8(0)
+	for b in data {
+		crc ^= b
+		for _ in 0 .. 8 {
+			if (crc & 0x80) != 0 {
+				crc = (crc << 1) ^ 0x07
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
 }
 
 fn char_idx(ch u8) int {
@@ -143,6 +156,7 @@ fn build_dns_query(host string, tx_id u16)[]u8 {
 	pkt << u8(0x00)
 	pkt << u8(0x00)
 	for label in host.split('.') {
+		if label.len == 0 { continue }
 		pkt << u8(label.len)
 		pkt << label.bytes()
 	}
@@ -153,7 +167,6 @@ fn build_dns_query(host string, tx_id u16)[]u8 {
 	pkt << u8(0x01)
 	return pkt
 }
-
 
 fn resolve_udp(host string) !i64 {
 	sw := time.new_stopwatch()
@@ -228,11 +241,9 @@ fn die(s string) {
 
 fn send_bit(bit_idx int, ts i64, base string, bit u8) {
 	if bit == 0 {
-		// Three queries to ensure it's cached.
-		// Using different sub-labels to avoid any single-query cache issues.
-		resolve('${bit_idx}${ts}.${base}') or {}
-		resolve('v${bit_idx}${ts}.${base}') or {}
-		resolve('w${bit_idx}${ts}.${base}') or {}
+		// Warm the cache. Multiple queries help bypass some resolver logic.
+		resolve('${bit_idx}.${ts}.${base}') or {}
+		resolve('v${bit_idx}.${ts}.${base}') or {}
 	}
 }
 
@@ -308,21 +319,13 @@ fn send_mode(base string, msg string) {
 }
 
 fn read_bit(bit_idx int, ts i64, base string, thr i64) u8 {
-	t1 := resolve_safe('${bit_idx}${ts}.${base}')
-	t2 := resolve_safe('v${bit_idx}${ts}.${base}')
-	t3 := resolve_safe('w${bit_idx}${ts}.${base}')
+	t1 := resolve_safe('${bit_idx}.${ts}.${base}')
+	t2 := resolve_safe('v${bit_idx}.${ts}.${base}')
 
 	mut t := t1
-	if t2 >= 0 && (t < 0 || t2 < t) {
-		t = t2
-	}
-	if t3 >= 0 && (t < 0 || t3 < t) {
-		t = t3
-	}
-	if t < 0 {
-		return 2 // error
-	}
+	if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
 
+	if t < 0 { return 2 }
 	return if t <= thr { u8(0) } else { u8(1) }
 }
 
@@ -382,7 +385,7 @@ fn rec_mode(base string, nbytes int) {
 	for pos < total_bits {
 		mut end := pos + g_workers
 		if end > total_bits { end = total_bits }
-		
+
 		mut threads := []thread u8{}
 		for i in pos .. end {
 			threads << spawn read_bit(i, ts, base, thr)
@@ -410,32 +413,137 @@ fn rec_mode(base string, nbytes int) {
 	println('\n[rx] "${decoded}"')
 }
 
+fn send_packet(base string, ts i64, data []u8) {
+	mut pkt := []u8{}
+	pkt << u8(data.len)
+	pkt << crc8(data)
+	pkt << data
+
+	total_bits := pkt.len * 8
+	// Use a worker-pool-like approach to limit concurrency
+	mut bit_pos := 0
+	for bit_pos < total_bits {
+		mut current_workers := 0
+		mut threads := []thread{}
+		for bit_pos < total_bits && current_workers < g_workers {
+			byte_idx := bit_pos / 8
+			bit_idx_in_byte := bit_pos % 8
+			bit := (pkt[byte_idx] >> (7 - bit_idx_in_byte)) & 1
+			threads << spawn send_bit(bit_pos, ts, base, bit)
+			bit_pos++
+			current_workers++
+		}
+		threads.wait()
+	}
+}
+
+fn receive_packet(base string, ts i64, max_bytes int) []u8 {
+	// First read header (2 bytes)
+	mut header_bits := []u8{len: 16}
+	for i in 0 .. 16 {
+		header_bits[i] = read_bit(i, ts, base, g_thr)
+	}
+
+	mut h0 := u8(0)
+	mut h1 := u8(0)
+	for i in 0 .. 8 { h0 = (h0 << 1) | header_bits[i] }
+	for i in 0 .. 8 { h1 = (h1 << 1) | header_bits[8 + i] }
+
+	len := int(h0)
+	if len == 0 || len > max_bytes || len == 255 { return []u8{} }
+
+	total_bits := (len + 2) * 8
+	mut bits := []u8{len: total_bits}
+	for i in 0 .. 16 { bits[i] = header_bits[i] }
+
+	mut pos := 16
+	for pos < total_bits {
+		mut current_workers := 0
+		mut threads := []thread u8{}
+		start_pos := pos
+		for pos < total_bits && current_workers < g_workers {
+			threads << spawn read_bit(pos, ts, base, g_thr)
+			pos++
+			current_workers++
+		}
+		res := threads.wait()
+		for i in 0 .. res.len {
+			bits[start_pos + i] = res[i]
+		}
+	}
+
+	mut data := []u8{len: len}
+	for i in 0 .. len {
+		mut ch := u8(0)
+		for b in 0 .. 8 {
+			ch = (ch << 1) | bits[16 + i * 8 + b]
+		}
+		data[i] = ch
+	}
+
+	if crc8(data) != h1 {
+		return []u8{}
+	}
+	return data
+}
+
 fn handle_socks_conn(mut conn net.TcpConn, base string) {
+	println('[socks] connection accepted')
 	defer { conn.close() or {} }
-	// Minimal SOCKS5 handshake
 	mut buf := []u8{len: 256}
 	n := conn.read(mut buf) or { return }
 	if n < 2 || buf[0] != 0x05 { return }
-
-	// No auth
 	conn.write([u8(0x05), 0x00]) or { return }
-
-	// Read request
 	n2 := conn.read(mut buf) or { return }
 	if n2 < 4 { return }
 
-	// We should connect to the target here, but in this DNS tunnel,
-	// we'd wrap everything in DNS queries.
-	// For this task, we focus on the DNS logic and 1KB/s speed.
+	// Address type: 0x01 = IPv4, 0x03 = Domain, 0x04 = IPv6
+	// We ignore the destination for now to keep it simple,
+	// but we could parse it and send it to the server.
 
 	conn.write([u8(0x05), 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) or { return }
-
 	println('[*] socks connection established')
-	// Tunneling logic would go here.
+
+	for {
+		mut data_buf := []u8{len: 256}
+		rn := conn.read(mut data_buf) or { break }
+		if rn <= 0 { break }
+
+		ts := get_ts()
+		println('[socks] tunneling ${rn} bytes in slot ${ts} (aiming for 1KB/s)')
+		send_packet(base, ts, data_buf[..rn])
+
+		time.sleep(5 * time.millisecond)
+	}
+}
+
+fn calibrate(base string) {
+	println('[*] calibrating threshold...')
+	mut fast_arr := []i64{}
+	mut slow_arr := []i64{}
+	for _ in 0 .. 5 {
+		f := resolve_safe('c0.${base}')
+		if f >= 0 { fast_arr << f }
+		time.sleep(20 * time.millisecond)
+	}
+	for _ in 0 .. 5 {
+		s := resolve_safe('u${rand.intn(99999) or { 1234 }}.${base}')
+		if s >= 0 { slow_arr << s }
+		time.sleep(20 * time.millisecond)
+	}
+	if fast_arr.len > 0 && slow_arr.len > 0 {
+		fast_arr.sort()
+		slow_arr.sort()
+		fast_med := fast_arr[fast_arr.len / 2]
+		slow_med := slow_arr[slow_arr.len / 2]
+		g_thr = (fast_med + slow_med) / 2
+		println('[*] calibrated: fast:${fast_med}µs slow:${slow_med}µs thr:${g_thr}µs')
+	}
 }
 
 fn socks_mode(mode string, base string, port int) {
 	println('[*] socks mode: ${mode} on port ${port}')
+	calibrate(base)
 	if mode == 'client' {
 		mut l := net.listen_tcp(.ip, '127.0.0.1:${port}') or { die(err.msg()) }
 		println('[*] socks client listening on 127.0.0.1:${port}')
@@ -443,8 +551,26 @@ fn socks_mode(mode string, base string, port int) {
 			mut conn := l.accept() or { continue }
 			spawn handle_socks_conn(mut conn, base)
 		}
+	} else if mode == 'server' {
+		println('[*] socks server polling DNS for data...')
+		mut last_ts := i64(0)
+		for {
+			ts := get_ts()
+			if ts <= last_ts {
+				time.sleep(50 * time.millisecond)
+				continue
+			}
+			last_ts = ts
+			data := receive_packet(base, ts, 256)
+			if data.len > 0 {
+				println('[socks-server] received packet: ${data.len} bytes')
+				// Here we would connect to the destination and forward the data.
+				// For now we just print it to verify.
+				println('[socks-server] data: ${data.bytestr()}')
+			}
+		}
 	} else {
-		die('server mode not implemented yet')
+		die('unknown socks mode: ' + mode)
 	}
 }
 
@@ -459,10 +585,6 @@ fn main() {
 		} else if os.args[i] == '--workers' && i + 1 < os.args.len {
 			g_workers = os.args[i + 1].int()
 			if g_workers < 1 { g_workers = 1 }
-			i += 2
-		} else if os.args[i] == '--window' && i + 1 < os.args.len {
-			window = os.args[i + 1].int()
-			if window < 1 { window = 1 }
 			i += 2
 		} else {
 			args << os.args[i]
