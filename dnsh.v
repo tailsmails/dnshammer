@@ -42,12 +42,12 @@ mut:
 }
 
 __global g_dns = ''
-__global g_workers = 1024
+__global g_workers = 512
 __global g_thr = i64(3000)
+__global g_window_ms = 200
 
 fn get_ts() i64 {
-	// High speed: 125ms slots. 1024 bits / 125ms = 1 KB/s.
-	return time.now().unix_milli() / 125
+	return time.now().unix_milli() / g_window_ms
 }
 
 fn crc8(data []u8) u8 {
@@ -169,32 +169,32 @@ fn build_dns_query(host string, tx_id u16)[]u8 {
 	return pkt
 }
 
+__global g_udp_conn = &net.UdpConn(unsafe { nil })
+__global g_udp_connected = false
+
+fn get_udp_conn() !&net.UdpConn {
+	if g_udp_connected { return g_udp_conn }
+	mut conn := net.dial_udp('${g_dns}:53') or { return error('dial_udp failed') }
+	conn.set_read_timeout(500 * time.millisecond)
+	unsafe { g_udp_conn = &conn }
+	g_udp_connected = true
+	return g_udp_conn
+}
+
 fn resolve_udp(host string) !i64 {
 	sw := time.new_stopwatch()
-	// Using the high-level V net module for better resource management
-	mut conn := net.dial_udp('${g_dns}:53') or { return error('dial_udp failed') }
-	conn.set_read_timeout(1000 * time.millisecond)
+	mut conn := get_udp_conn() or { return error(err.msg()) }
 	
 	tx_id := u16(rand.intn(65535) or { 0 })
 	pkt := build_dns_query(host, tx_id)
 	
-	conn.write(pkt) or {
-		conn.close() or {}
-		return error('send failed')
-	}
+	conn.write(pkt) or { return error('send failed') }
 	
 	mut buf := []u8{len: 512}
-	n, _ := conn.read(mut buf) or {
-		conn.close() or {}
-		return error('timeout')
-	}
+	n, _ := conn.read(mut buf) or { return error('timeout') }
 
 	elapsed := sw.elapsed().microseconds()
-	conn.close() or {}
-
-	if n < 0 {
-		return error('read error')
-	}
+	if n < 0 { return error('read error') }
 	return elapsed
 }
 
@@ -233,9 +233,8 @@ fn die(s string) {
 
 fn send_bit(bit_idx int, ts i64, prefix string, base string, bit u8) {
 	if bit == 0 {
-		// Warm the cache. Multiple queries help bypass some resolver logic.
+		// Warm the cache.
 		resolve('${prefix}${bit_idx}.${ts}.${base}') or {}
-		resolve('v${prefix}${bit_idx}.${ts}.${base}') or {}
 	}
 }
 
@@ -419,33 +418,47 @@ fn send_packet(prefix string, base string, ts i64, data []u8) {
 }
 
 fn read_bit(bit_idx int, ts i64, prefix string, base string, thr i64) u8 {
-	t1 := resolve_safe('${prefix}${bit_idx}.${ts}.${base}')
-	t2 := resolve_safe('v${prefix}${bit_idx}.${ts}.${base}')
-	mut t := t1
-	if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
+	t := resolve_safe('${prefix}${bit_idx}.${ts}.${base}')
 	if t < 0 { return 2 }
 	return if t <= thr { u8(0) } else { u8(1) }
 }
 
 fn receive_packet(prefix string, base string, ts i64, max_bytes int) []u8 {
-	mut header_bits := []u8{len: 16}
-	for i in 0 .. 16 {
-		header_bits[i] = read_bit(i, ts, prefix, base, g_thr)
+	// Read header and potential data in one go if possible
+	// Header is 2 bytes (16 bits)
+	num_header_bits := 16
+	mut bits := []u8{len: (max_bytes + 2) * 8}
+
+	// Read first 128 bits (header + some data) in parallel
+	mut pos := 0
+	mut initial_read := 128
+	if initial_read > bits.len { initial_read = bits.len }
+
+	for pos < initial_read {
+		mut current_workers := 0
+		mut threads := []thread u8{}
+		start_pos := pos
+		for pos < initial_read && current_workers < g_workers {
+			threads << spawn read_bit(pos, ts, prefix, base, g_thr)
+			pos++
+			current_workers++
+		}
+		res := threads.wait()
+		for i in 0 .. res.len {
+			bits[start_pos + i] = res[i]
+		}
 	}
 
 	mut h0 := u8(0)
 	mut h1 := u8(0)
-	for i in 0 .. 8 { h0 = (h0 << 1) | header_bits[i] }
-	for i in 0 .. 8 { h1 = (h1 << 1) | header_bits[8 + i] }
+	for i in 0 .. 8 { h0 = (h0 << 1) | bits[i] }
+	for i in 0 .. 8 { h1 = (h1 << 1) | bits[8 + i] }
 
 	len := int(h0)
 	if len == 0 || len > max_bytes || len == 255 { return []u8{} }
 
 	total_bits := (len + 2) * 8
-	mut bits := []u8{len: total_bits}
-	for i in 0 .. 16 { bits[i] = header_bits[i] }
-
-	mut pos := 16
+	// Continue reading if we haven't read enough bits yet
 	for pos < total_bits {
 		mut current_workers := 0
 		mut threads := []thread u8{}
