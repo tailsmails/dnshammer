@@ -46,7 +46,8 @@ __global g_workers = 1024
 __global g_thr = i64(3000)
 
 fn get_ts() i64 {
-	return time.now().unix_milli() / 250
+	// High speed: 125ms slots. 1024 bits / 125ms = 1 KB/s.
+	return time.now().unix_milli() / 125
 }
 
 fn crc8(data []u8) u8 {
@@ -170,38 +171,29 @@ fn build_dns_query(host string, tx_id u16)[]u8 {
 
 fn resolve_udp(host string) !i64 {
 	sw := time.new_stopwatch()
-	fd := C.socket(C.AF_INET, C.SOCK_DGRAM, 0)
-	if fd < 0 {
-		return error('socket failed')
-	}
-	tv := SockTimeout{sec: 1, usec: 0}
-	C.setsockopt(fd, C.SOL_SOCKET, C.SO_RCVTIMEO, &tv, sizeof(tv))
-	mut sa := C.sockaddr_in{}
-	sa.sin_family = u16(C.AF_INET)
-	sa.sin_port = C.htons(53)
-	C.inet_pton(C.AF_INET, g_dns.str, &sa.sin_addr)
-	
-	// We don't strictly need connect for UDP, but it allows using send/recv
-	if C.connect(fd, &sa, sizeof(sa)) < 0 {
-		C.close(fd)
-		return error('connect failed')
-	}
+	// Using the high-level V net module for better resource management
+	mut conn := net.dial_udp('${g_dns}:53') or { return error('dial_udp failed') }
+	conn.set_read_timeout(1000 * time.millisecond)
 	
 	tx_id := u16(rand.intn(65535) or { 0 })
 	pkt := build_dns_query(host, tx_id)
 	
-	if C.send(fd, pkt.data, usize(pkt.len), 0) < 0 {
-		C.close(fd)
+	conn.write(pkt) or {
+		conn.close() or {}
 		return error('send failed')
 	}
 	
 	mut buf := []u8{len: 512}
-	n := C.recv(fd, buf.data, usize(512), 0)
+	n, _ := conn.read(mut buf) or {
+		conn.close() or {}
+		return error('timeout')
+	}
+
 	elapsed := sw.elapsed().microseconds()
-	C.close(fd)
+	conn.close() or {}
 
 	if n < 0 {
-		return error('timeout')
+		return error('read error')
 	}
 	return elapsed
 }
@@ -239,11 +231,11 @@ fn die(s string) {
 	exit(1)
 }
 
-fn send_bit(bit_idx int, ts i64, base string, bit u8) {
+fn send_bit(bit_idx int, ts i64, prefix string, base string, bit u8) {
 	if bit == 0 {
 		// Warm the cache. Multiple queries help bypass some resolver logic.
-		resolve('${bit_idx}.${ts}.${base}') or {}
-		resolve('v${bit_idx}.${ts}.${base}') or {}
+		resolve('${prefix}${bit_idx}.${ts}.${base}') or {}
+		resolve('v${prefix}${bit_idx}.${ts}.${base}') or {}
 	}
 }
 
@@ -272,7 +264,7 @@ fn send_mode(base string, msg string) {
 			byte_idx := i / 8
 			bit_idx_in_byte := i % 8
 			bit := (data[byte_idx] >> (7 - bit_idx_in_byte)) & 1
-			threads << spawn send_bit(i, ts, base, bit)
+			threads << spawn send_bit(i, ts, '', base, bit)
 		}
 		threads.wait()
 		bit_pos_tx = end
@@ -305,7 +297,7 @@ fn send_mode(base string, msg string) {
 				bit_idx_in_byte := i % 8
 				bit := (data[byte_idx] >> (7 - bit_idx_in_byte)) & 1
 				if bit == 0 {
-					threads << spawn send_bit(i, cur_ts, base, 0)
+					threads << spawn send_bit(i, cur_ts, '', base, 0)
 					refreshed++
 				}
 			}
@@ -318,16 +310,6 @@ fn send_mode(base string, msg string) {
 	}
 }
 
-fn read_bit(bit_idx int, ts i64, base string, thr i64) u8 {
-	t1 := resolve_safe('${bit_idx}.${ts}.${base}')
-	t2 := resolve_safe('v${bit_idx}.${ts}.${base}')
-
-	mut t := t1
-	if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
-
-	if t < 0 { return 2 }
-	return if t <= thr { u8(0) } else { u8(1) }
-}
 
 fn rec_mode(base string, nbytes int) {
 	println('[rx] reading ${nbytes} wire bytes (huffman)...\n')
@@ -388,7 +370,7 @@ fn rec_mode(base string, nbytes int) {
 
 		mut threads := []thread u8{}
 		for i in pos .. end {
-			threads << spawn read_bit(i, ts, base, thr)
+			threads << spawn read_bit(i, ts, '', base, thr)
 		}
 
 		res := threads.wait()
@@ -413,14 +395,13 @@ fn rec_mode(base string, nbytes int) {
 	println('\n[rx] "${decoded}"')
 }
 
-fn send_packet(base string, ts i64, data []u8) {
+fn send_packet(prefix string, base string, ts i64, data []u8) {
 	mut pkt := []u8{}
 	pkt << u8(data.len)
 	pkt << crc8(data)
 	pkt << data
 
 	total_bits := pkt.len * 8
-	// Use a worker-pool-like approach to limit concurrency
 	mut bit_pos := 0
 	for bit_pos < total_bits {
 		mut current_workers := 0
@@ -429,7 +410,7 @@ fn send_packet(base string, ts i64, data []u8) {
 			byte_idx := bit_pos / 8
 			bit_idx_in_byte := bit_pos % 8
 			bit := (pkt[byte_idx] >> (7 - bit_idx_in_byte)) & 1
-			threads << spawn send_bit(bit_pos, ts, base, bit)
+			threads << spawn send_bit(bit_pos, ts, prefix, base, bit)
 			bit_pos++
 			current_workers++
 		}
@@ -437,11 +418,19 @@ fn send_packet(base string, ts i64, data []u8) {
 	}
 }
 
-fn receive_packet(base string, ts i64, max_bytes int) []u8 {
-	// First read header (2 bytes)
+fn read_bit(bit_idx int, ts i64, prefix string, base string, thr i64) u8 {
+	t1 := resolve_safe('${prefix}${bit_idx}.${ts}.${base}')
+	t2 := resolve_safe('v${prefix}${bit_idx}.${ts}.${base}')
+	mut t := t1
+	if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
+	if t < 0 { return 2 }
+	return if t <= thr { u8(0) } else { u8(1) }
+}
+
+fn receive_packet(prefix string, base string, ts i64, max_bytes int) []u8 {
 	mut header_bits := []u8{len: 16}
 	for i in 0 .. 16 {
-		header_bits[i] = read_bit(i, ts, base, g_thr)
+		header_bits[i] = read_bit(i, ts, prefix, base, g_thr)
 	}
 
 	mut h0 := u8(0)
@@ -462,7 +451,7 @@ fn receive_packet(base string, ts i64, max_bytes int) []u8 {
 		mut threads := []thread u8{}
 		start_pos := pos
 		for pos < total_bits && current_workers < g_workers {
-			threads << spawn read_bit(pos, ts, base, g_thr)
+			threads << spawn read_bit(pos, ts, prefix, base, g_thr)
 			pos++
 			current_workers++
 		}
@@ -488,32 +477,45 @@ fn receive_packet(base string, ts i64, max_bytes int) []u8 {
 }
 
 fn handle_socks_conn(mut conn net.TcpConn, base string) {
-	println('[socks] connection accepted')
+	println('[socks-client] connection accepted')
 	defer { conn.close() or {} }
-	mut buf := []u8{len: 256}
+	mut buf := []u8{len: 512}
 	n := conn.read(mut buf) or { return }
 	if n < 2 || buf[0] != 0x05 { return }
 	conn.write([u8(0x05), 0x00]) or { return }
 	n2 := conn.read(mut buf) or { return }
 	if n2 < 4 { return }
 
-	// Address type: 0x01 = IPv4, 0x03 = Domain, 0x04 = IPv6
-	// We ignore the destination for now to keep it simple,
-	// but we could parse it and send it to the server.
+	mut dest_info := []u8{}
+	dest_info << buf[3..n2]
+
+	ts_start := get_ts()
+	println('[socks-client] sending destination info in slot ${ts_start}')
+	send_packet('u', base, ts_start, dest_info)
 
 	conn.write([u8(0x05), 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) or { return }
-	println('[*] socks connection established')
+	println('[socks-client] tunnel established')
 
 	for {
-		mut data_buf := []u8{len: 256}
-		rn := conn.read(mut data_buf) or { break }
-		if rn <= 0 { break }
+		// Non-blocking read from local app
+		conn.set_read_timeout(100 * time.millisecond)
+		mut data_buf := []u8{len: 128}
+		rn := conn.read(mut data_buf) or { 0 }
 
 		ts := get_ts()
-		println('[socks] tunneling ${rn} bytes in slot ${ts} (aiming for 1KB/s)')
-		send_packet(base, ts, data_buf[..rn])
+		if rn > 0 {
+			println('[socks-client] UP -> ${rn} bytes')
+			send_packet('u', base, ts, data_buf[..rn])
+		}
 
-		time.sleep(5 * time.millisecond)
+		// Poll for DOWNSTREAM data from DNS
+		down_data := receive_packet('d', base, ts, 128)
+		if down_data.len > 0 {
+			println('[socks-client] DOWN <- ${down_data.len} bytes')
+				conn.write(down_data) or { 0 }
+		}
+
+		time.sleep(100 * time.millisecond)
 	}
 }
 
@@ -541,12 +543,12 @@ fn calibrate(base string) {
 	}
 }
 
-fn socks_mode(mode string, base string, port int) {
-	println('[*] socks mode: ${mode} on port ${port}')
+fn socks_mode(mode string, base string, socks_port int) {
+	println('[*] socks mode: ${mode} on port ${socks_port}')
 	calibrate(base)
 	if mode == 'client' {
-		mut l := net.listen_tcp(.ip, '127.0.0.1:${port}') or { die(err.msg()) }
-		println('[*] socks client listening on 127.0.0.1:${port}')
+		mut l := net.listen_tcp(.ip, '127.0.0.1:${socks_port}') or { die(err.msg()) }
+		println('[*] socks client listening on 127.0.0.1:${socks_port}')
 		for {
 			mut conn := l.accept() or { continue }
 			spawn handle_socks_conn(mut conn, base)
@@ -554,6 +556,9 @@ fn socks_mode(mode string, base string, port int) {
 	} else if mode == 'server' {
 		println('[*] socks server polling DNS for data...')
 		mut last_ts := i64(0)
+		mut is_connected := false
+		mut target_conn := net.TcpConn{}
+
 		for {
 			ts := get_ts()
 			if ts <= last_ts {
@@ -561,12 +566,44 @@ fn socks_mode(mode string, base string, port int) {
 				continue
 			}
 			last_ts = ts
-			data := receive_packet(base, ts, 256)
+
+			// Poll UPSTREAM
+			data := receive_packet('u', base, ts, 128)
 			if data.len > 0 {
-				println('[socks-server] received packet: ${data.len} bytes')
-				// Here we would connect to the destination and forward the data.
-				// For now we just print it to verify.
-				println('[socks-server] data: ${data.bytestr()}')
+				if !is_connected {
+					atyp := data[0]
+					mut addr := ''
+					mut port := u16(0)
+					if atyp == 0x01 {
+						addr = '${data[1]}.${data[2]}.${data[3]}.${data[4]}'
+						port = (u16(data[5]) << 8) | data[6]
+					} else if atyp == 0x03 {
+						len := int(data[1])
+						addr = data[2..2+len].bytestr()
+						port = (u16(data[2+len]) << 8) | data[3+len]
+					}
+					if addr != '' {
+						println('[socks-server] connecting to ${addr}:${port}...')
+						if mut tc := net.dial_tcp('${addr}:${port}') {
+							target_conn = tc
+							is_connected = true
+						}
+					}
+				} else {
+					println('[socks-server] UP -> ${data.len} bytes')
+					target_conn.write(data) or { is_connected = false }
+				}
+			}
+
+			// Poll TARGET for DOWNSTREAM
+			if is_connected {
+				target_conn.set_read_timeout(50 * time.millisecond)
+				mut down_buf := []u8{len: 128}
+				dn := target_conn.read(mut down_buf) or { 0 }
+				if dn > 0 {
+					println('[socks-server] DOWN <- ${dn} bytes')
+					send_packet('d', base, ts, down_buf[..dn])
+				}
 			}
 		}
 	} else {
