@@ -43,6 +43,7 @@ mut:
 __global g_dns = ''
 __global g_workers = 4
 __global window = 100
+__global g_fallback_notified = false
 
 fn get_ts() i64 {
 	return time.now().unix() / window
@@ -268,6 +269,45 @@ fn get_local_ip(dns_ip string)[]u8 {
 	return [unsafe{ptr[0]}, unsafe{ptr[1]}, unsafe{ptr[2]}, unsafe{ptr[3]}]
 }
 
+fn resolve_udp(host string) !i64 {
+	$if windows { return error('udp resolve not implemented on windows') }
+
+	mut sa := C.sockaddr_in{}
+	sa.sin_family = u16(C.AF_INET)
+	sa.sin_port = C.htons(53)
+	if C.inet_pton(C.AF_INET, g_dns.str, &sa.sin_addr) <= 0 {
+		return error('invalid dns ip')
+	}
+
+	fd := C.socket(C.AF_INET, C.SOCK_DGRAM, 0)
+	if fd < 0 { return error('failed to create socket') }
+
+	if C.connect(fd, &sa, sizeof(sa)) < 0 {
+		C.close(fd)
+		return error('connect failed')
+	}
+
+	tx_id := u16(rand.intn(65535) or { 0 })
+	dns_payload := build_dns_query(host, tx_id)
+
+	tv := SockTimeout{sec: 2, usec: 0}
+	C.setsockopt(fd, C.SOL_SOCKET, C.SO_RCVTIMEO, &tv, sizeof(tv))
+
+	sw := time.new_stopwatch()
+	if C.send(fd, dns_payload.data, dns_payload.len, 0) < 0 {
+		C.close(fd)
+		return error('send failed')
+	}
+
+	mut buf := []u8{len: 512}
+	n := C.recv(fd, buf.data, 512, 0)
+	elapsed := sw.elapsed().microseconds()
+	C.close(fd)
+
+	if n < 0 { return error('timeout') }
+	return elapsed
+}
+
 fn resolve_raw(host string) !i64 {
 	$if windows { return error('raw sockets not supported on windows') }
 	
@@ -319,7 +359,15 @@ fn resolve_raw(host string) !i64 {
 }
 
 fn resolve(host string) !i64 {
-	if g_dns.len > 0 { return resolve_raw(host) }
+	if g_dns.len > 0 {
+		return resolve_raw(host) or {
+			if !g_fallback_notified {
+				println('[*] Raw sockets failed (root required?), falling back to UDP mode')
+				g_fallback_notified = true
+			}
+			return resolve_udp(host)
+		}
+	}
 	sw := time.new_stopwatch()
 	_ := C.gethostbyname(host.str)
 	elapsed := sw.elapsed().microseconds()
@@ -422,7 +470,7 @@ fn send_mode(base string, msg string) {
 
 fn rec_mode(base string, nbytes int) {
 	println('[rx] reading ${nbytes} wire bytes (huffman)...\n')
-	println('[rx] calibrating using Raw Sockets...')
+	println('[rx] calibrating...')
 
 	mut fast_arr := []i64{}
 	mut slow_arr :=[]i64{}
