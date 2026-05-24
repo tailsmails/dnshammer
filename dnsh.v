@@ -499,13 +499,6 @@ fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, d
 	return res
 }
 
-fn simple_hash(data []u8) u8 {
-	mut h := u32(0)
-	for b in data {
-		h = (h * 31) + u32(b)
-	}
-	return u8(h & 0xFF)
-}
 
 fn calibrate(base string) !i64 {
 	println('[*] calibrating...')
@@ -542,6 +535,17 @@ fn bits_to_int(bits []u8) u32 {
 	return val
 }
 
+fn is_fuzzy_match(val u16, target u16) bool {
+	mut matches := 0
+	for i in 0 .. 4 {
+		shift := i * 4
+		if ((val >> shift) & 0xF) == ((target >> shift) & 0xF) {
+			matches++
+		}
+	}
+	return matches >= 3
+}
+
 fn int_to_bits(val int, num_bits int) []u8 {
 	mut res := []u8{len: num_bits}
 	for i in 0 .. num_bits {
@@ -553,22 +557,17 @@ fn int_to_bits(val int, num_bits int) []u8 {
 fn send_mode(base string, msg string) {
 	thr := calibrate(base) or { die('calibration failed') }
 	
-	mut raw_data, filtered := huffman_encode(msg)
-	h := simple_hash(raw_data)
-	
-	mut data := []u8{}
-	data << h
-	data << raw_data
+	mut data, filtered := huffman_encode(msg)
 	// Append AA AA (magic_eom)
 	data << u8(magic_eom >> 8)
 	data << u8(magic_eom & 0xFF)
 
 	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
-	println('[tx] Hash: ${h:02X}')
-	println('[tx] ${data.len} total wire bytes (incl. Hash + EOM)')
+	println('[tx] ${data.len} total wire bytes (incl. EOM)')
 	println('[tx] chunk size: ${g_chunk_size}')
 	
 	pi_check := get_phase_info()
+	// Index (1) + Payload (g_chunk_size) + Terminator (2)
 	wire_chunk_size := 1 + g_chunk_size + 2
 	
 	estimated_bits := wire_chunk_size * 8
@@ -587,11 +586,13 @@ fn send_mode(base string, msg string) {
 		mut end := pos + g_chunk_size
 		if end > data.len { end = data.len }
 		
+		mut payload := data[pos..end].clone()
+		// Padding payload to g_chunk_size
+		for payload.len < g_chunk_size { payload << u8(0) }
+
 		mut chunk := []u8{}
 		chunk << chunk_idx
-		chunk << data[pos..end]
-		// Padding
-		for chunk.len < 1 + g_chunk_size { chunk << u8(0) }
+		chunk << payload
 		
 		if end < data.len {
 			chunk << u8(magic_chunk_end >> 8)
@@ -683,6 +684,7 @@ fn send_mode(base string, msg string) {
 fn rec_mode(base string) {
 	thr := calibrate(base) or { die('calibration failed') }
 	pi_check := get_phase_info()
+	// Index (1) + Payload (g_chunk_size) + Terminator (2)
 	wire_chunk_size := 1 + g_chunk_size + 2
 	estimated_bits := wire_chunk_size * 8
 	estimated_time := i64(estimated_bits) * 550
@@ -690,8 +692,6 @@ fn rec_mode(base string) {
 		die('Window too small for chunk size ${g_chunk_size}. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
 	}
 
-	mut expected_hash := u8(0)
-	mut hash_received := false
 	mut final_data := []u8{}
 	mut finished := false
 	mut last_accepted_idx := -1
@@ -716,29 +716,26 @@ fn rec_mode(base string) {
 				chunk_full << u8(bits_to_int(bits[i*8 .. (i+1)*8]))
 			}
 			
-			chunk_idx := int(chunk_full[0])
-			terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
+			chunk_idx := chunk_full[0]
 			payload := chunk_full[1..wire_chunk_size-2].clone()
+			terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
 			
-			if terminator == magic_chunk_end || terminator == magic_eom {
+			// Verify terminator with fuzzy matching
+			is_eom := is_fuzzy_match(terminator, magic_eom)
+			is_chunk_end := is_fuzzy_match(terminator, magic_chunk_end)
+
+			if is_chunk_end || is_eom {
 				println('[rx] Chunk #${chunk_idx} valid (terminator: ${terminator:04X})')
 				
-				if chunk_idx > last_accepted_idx {
+				if int(chunk_idx) > last_accepted_idx {
 					mut chunk_data := payload.clone()
 					
-					if !hash_received {
-						expected_hash = chunk_data[0]
-						chunk_data = chunk_data[1..].clone()
-						hash_received = true
-						println('[rx] Received message hash: ${expected_hash:02X}')
-					}
-					
-					if terminator == magic_eom {
+					if is_eom {
 						finished = true
 					}
 					
 					final_data << chunk_data
-					last_accepted_idx = chunk_idx
+					last_accepted_idx = int(chunk_idx)
 					println('[rx] Chunk accepted.')
 				} else {
 					println('[rx] Chunk #${chunk_idx} already accepted, skipping.')
@@ -775,13 +772,6 @@ fn rec_mode(base string) {
 		}
 	}
 	
-	actual_hash := simple_hash(final_data)
-	if actual_hash != expected_hash {
-		println('[!] Hash mismatch! Expected: ${expected_hash:02X}, Actual: ${actual_hash:02X}')
-	} else {
-		println('[rx] Hash verified successfully.')
-	}
-
 	decoded := huffman_decode(final_data)
 	println('\n[rx] Final message: "${decoded}"')
 	
