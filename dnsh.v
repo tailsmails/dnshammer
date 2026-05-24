@@ -590,11 +590,12 @@ fn send_mode(base string, msg string) {
 
 	println('[tx] Waiting for receiver READY signal (0111)...')
 	for {
+		// Sender waits for TK to read receiver status
 		pi_tk := wait_for_phase(2)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
-		// 1. Read status from receiver domain in second half of TK
+		// Read READY from receiver in second half of TK
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 		status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { []u8{} }
 		if status_bits.len == 4 {
@@ -602,7 +603,7 @@ fn send_mode(base string, msg string) {
 			if status == status_ready {
 				println('[tx] Receiver is READY. Acknowledging and starting.')
 
-				// 2. Acknowledge in first half of NEXT TK
+				// Acknowledge in first half of NEXT TK
 				pi_tk_next := wait_for_phase(2)
 				cts_tk_next := pi_tk_next.cycle_start / 1000
 				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
@@ -610,7 +611,7 @@ fn send_mode(base string, msg string) {
 				break
 			}
 		}
-		time.sleep(500 * time.millisecond)
+		time.sleep(100 * time.millisecond)
 	}
 
 	mut pos := 0
@@ -753,27 +754,34 @@ fn rec_mode(base string) {
 	mut finished := false
 	mut last_accepted_idx := -1
 
-	println('[rx] Waiting for sender acknowledgement (1100) after sending READY (0111)...')
+	println('[rx] Sending READY (0111) and waiting for START (1100)...')
 	for {
+		pi := wait_for_phase(1) // Cycle start
+		cts := pi.cycle_start / 1000
+
+		// 1. Send READY in final third of T2
+		t2_start := pi.cycle_start + pi.t1_len
+		t2_third := pi.t2_len / 3
+		ready_time := t2_start + 2 * t2_third
+		for get_ts() < ready_time { time.sleep(100 * time.millisecond) }
+		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi.phase_end, cts)
+
+		// 2. Read START from sender in first half of TK
 		pi_tk := wait_for_phase(2)
-		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
-		// 1. Read from sender domain in first half of TK
-		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts_tk) or { []u8{} }
+		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts) or { []u8{} }
 		if conf_bits.len == 4 {
 			status := bits_to_int(conf_bits)
 			if status == status_start {
-				println('[rx] Sender acknowledged. Starting reading loop.')
+				println('[rx] START detected. Entering reading loop.')
 				break
 			}
 		}
 
-		// 2. Send READY in second half of TK
+		// 3. Send READY in second half of TK
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi_tk.phase_end, cts_tk)
-
-		time.sleep(500 * time.millisecond)
+		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi_tk.phase_end, cts)
 	}
 
 	for !finished {
