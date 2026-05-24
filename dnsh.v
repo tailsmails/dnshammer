@@ -43,6 +43,7 @@ mut:
 __global g_dns = ''
 __global g_workers = 4
 __global window = 100
+__global g_hs_window = 10
 __global g_chunk_size = 5
 __global g_tk_len = 6
 __global g_fallback_notified = false
@@ -74,10 +75,10 @@ struct PhaseInfo {
 	tk_len      i64
 }
 
-fn get_phase_info() PhaseInfo {
+fn get_phase_info(w int) PhaseInfo {
 	now := get_ts()
 	tk_duration := i64(g_tk_len) * 8 * 100
-	total_cycle := i64(window) * 1000
+	total_cycle := i64(w) * 1000
 
 	t_rem := total_cycle - tk_duration
 	t1_duration := t_rem / 2
@@ -110,9 +111,9 @@ fn get_phase_info() PhaseInfo {
 	}
 }
 
-fn wait_for_phase(target_phase int) PhaseInfo {
+fn wait_for_phase(target_phase int, w int) PhaseInfo {
 	for {
-		pi := get_phase_info()
+		pi := get_phase_info(w)
 		if pi.phase == target_phase {
 			return pi
 		}
@@ -121,7 +122,7 @@ fn wait_for_phase(target_phase int) PhaseInfo {
 			time.sleep(sleep_ms * time.millisecond)
 		}
 	}
-	return get_phase_info()
+	return get_phase_info(w)
 }
 
 fn char_idx(ch u8) int {
@@ -578,7 +579,7 @@ fn send_mode(base string, msg string) {
 	println('[tx] ${data.len} total wire bytes (incl. Hash)')
 	println('[tx] chunk size: ${g_chunk_size}')
 
-	pi_check := get_phase_info()
+	pi_check := get_phase_info(window)
 	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2)
 	wire_chunk_size := 1 + 1 + g_chunk_size + 2
 
@@ -591,7 +592,7 @@ fn send_mode(base string, msg string) {
 	println('[tx] Waiting for receiver READY signal (0111)...')
 	for {
 		// Sender waits for TK to read receiver status
-		pi_tk := wait_for_phase(2)
+		pi_tk := wait_for_phase(2, g_hs_window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
@@ -603,11 +604,19 @@ fn send_mode(base string, msg string) {
 			if status == status_ready {
 				println('[tx] Receiver is READY. Acknowledging and starting.')
 
+				println('[tx] Sending START acknowledgement...')
+				// Wait for current TK to end
+				time.sleep(int(pi_tk.phase_end - get_ts()) + 10)
+
 				// Acknowledge in first half of NEXT TK
-				pi_tk_next := wait_for_phase(2)
+				pi_tk_next := wait_for_phase(2, g_hs_window)
 				cts_tk_next := pi_tk_next.cycle_start / 1000
 				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
 				send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_next, cts_tk_next)
+
+				// Ensure we are past the acknowledgment window
+				for get_ts() < tk_mid_next { time.sleep(100 * time.millisecond) }
+				println('[tx] Handshake complete.')
 				break
 			}
 		}
@@ -618,7 +627,7 @@ fn send_mode(base string, msg string) {
 	mut chunk_idx := u8(0)
 	mut resending := false
 	for pos < data.len {
-		pi := wait_for_phase(0) // Wait for T1
+		pi := wait_for_phase(0, window) // Wait for T1
 		cts := pi.cycle_start / 1000
 
 		mut end := pos + g_chunk_size
@@ -674,7 +683,7 @@ fn send_mode(base string, msg string) {
 		}
 
 		// TK window
-		pi_tk := wait_for_phase(2)
+		pi_tk := wait_for_phase(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 		send_bits(base, "s", 0, int_to_bits(status_ok, 4), tk_mid, cts_tk)
@@ -715,7 +724,7 @@ fn send_mode(base string, msg string) {
 	println('[tx] Entering final termination handshake...')
 	for attempt in 0 .. 10 {
 		println('[tx] Termination handshake attempt #${attempt+1}...')
-		pi_tk := wait_for_phase(2)
+		pi_tk := wait_for_phase(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
@@ -725,7 +734,7 @@ fn send_mode(base string, msg string) {
 			status := bits_to_int(status_bits)
 			if status == status_stop {
 				println('[tx] Received STOP. Sending CONFIRM.')
-				pi_tk_next := wait_for_phase(2)
+				pi_tk_next := wait_for_phase(2, window)
 				cts_tk_next := pi_tk_next.cycle_start / 1000
 				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
 				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next, cts_tk_next)
@@ -739,7 +748,7 @@ fn send_mode(base string, msg string) {
 
 fn rec_mode(base string) {
 	thr := calibrate(base) or { die('calibration failed') }
-	pi_check := get_phase_info()
+	pi_check := get_phase_info(window)
 	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2)
 	wire_chunk_size := 1 + 1 + g_chunk_size + 2
 	estimated_bits := wire_chunk_size * 8
@@ -756,7 +765,7 @@ fn rec_mode(base string) {
 
 	println('[rx] Sending READY (0111) and waiting for START (1100)...')
 	for {
-		pi := wait_for_phase(1) // Cycle start
+		pi := wait_for_phase(1, g_hs_window) // Cycle start
 		cts := pi.cycle_start / 1000
 
 		// 1. Send READY in final third of T2
@@ -767,10 +776,11 @@ fn rec_mode(base string) {
 		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi.phase_end, cts)
 
 		// 2. Read START from sender in first half of TK
-		pi_tk := wait_for_phase(2)
+		pi_tk := wait_for_phase(2, g_hs_window)
+		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
-		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts) or { []u8{} }
+		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts_tk) or { []u8{} }
 		if conf_bits.len == 4 {
 			status := bits_to_int(conf_bits)
 			if status == status_start {
@@ -785,7 +795,7 @@ fn rec_mode(base string) {
 	}
 
 	for !finished {
-		pi := wait_for_phase(1) // Wait for T2
+		pi := wait_for_phase(1, window) // Wait for T2
 		cts := pi.cycle_start / 1000
 		println('[rx] Cycle start, reading chunk...')
 
@@ -866,7 +876,7 @@ fn rec_mode(base string) {
 		send_bits(base, "r", 0, int_to_bits(status_val, 4), pi.phase_end, cts)
 
 		// TK window
-		pi_tk := wait_for_phase(2)
+		pi_tk := wait_for_phase(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
@@ -899,7 +909,7 @@ fn rec_mode(base string) {
 
 	println('[rx] Entering termination handshake...')
 	for _ in 0 .. 5 {
-		pi := wait_for_phase(1)
+		pi := wait_for_phase(1, window)
 		cts := pi.cycle_start / 1000
 
 		t2_start := pi.cycle_start + pi.t1_len
@@ -909,7 +919,7 @@ fn rec_mode(base string) {
 		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi.phase_end, cts)
 
 		// TK window
-		pi_tk := wait_for_phase(2)
+		pi_tk := wait_for_phase(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
@@ -941,6 +951,10 @@ fn main() {
 		} else if os.args[i] == '--window' && i + 1 < os.args.len {
 			window = os.args[i + 1].int()
 			if window < 1 { window = 1 }
+			i += 2
+		} else if os.args[i] == '--hs-window' && i + 1 < os.args.len {
+			g_hs_window = os.args[i + 1].int()
+			if g_hs_window < 1 { g_hs_window = 1 }
 			i += 2
 		} else if os.args[i] == '--chunk-size' && i + 1 < os.args.len {
 			g_chunk_size = os.args[i + 1].int()
