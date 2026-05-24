@@ -43,10 +43,84 @@ mut:
 __global g_dns = ''
 __global g_workers = 4
 __global window = 100
+__global g_chunk_size = 5
+__global g_tk_len = 6
 __global g_fallback_notified = false
 
+const magic_eof = u16(0xFFFF)
+const magic_no_signal = u16(0x0000)
+const magic_eom = u16(0xAAAA)
+const magic_chunk_end = u16(0xEEEE)
+
+const status_success = 0b0110
+const status_success_n = 0b0100
+const status_error = 0b1001
+const status_ok = 0b1010
+const status_start = 0b1100
+const status_stop = 0b0001
+const status_confirm_stop = 0b1000
+
 fn get_ts() i64 {
-	return time.now().unix() / window
+	return time.now().unix_milli()
+}
+
+struct PhaseInfo {
+	cycle_start i64
+	phase       int
+	phase_end   i64
+	t1_len      i64
+	t2_len      i64
+	tk_len      i64
+}
+
+fn get_phase_info() PhaseInfo {
+	now := get_ts()
+	tk_duration := i64(g_tk_len) * 8 * 100
+	total_cycle := i64(window) * 1000
+	
+	t_rem := total_cycle - tk_duration
+	t1_duration := t_rem / 2
+	t2_duration := t_rem / 2
+	
+	cycle_start := (now / total_cycle) * total_cycle
+	elapsed := now % total_cycle
+	
+	mut phase := 0
+	mut phase_end := cycle_start + t1_duration
+	
+	if elapsed < t1_duration {
+		phase = 0
+		phase_end = cycle_start + t1_duration
+	} else if elapsed < t1_duration + t2_duration {
+		phase = 1
+		phase_end = cycle_start + t1_duration + t2_duration
+	} else {
+		phase = 2
+		phase_end = cycle_start + total_cycle
+	}
+	
+	return PhaseInfo{
+		cycle_start: cycle_start
+		phase: phase
+		phase_end: phase_end
+		t1_len: t1_duration
+		t2_len: t2_duration
+		tk_len: tk_duration
+	}
+}
+
+fn wait_for_phase(target_phase int) PhaseInfo {
+	for {
+		pi := get_phase_info()
+		if pi.phase == target_phase {
+			return pi
+		}
+		sleep_ms := int(pi.phase_end - get_ts()) + 10
+		if sleep_ms > 0 {
+			time.sleep(sleep_ms * time.millisecond)
+		}
+	}
+	return get_phase_info()
 }
 
 fn char_idx(ch u8) int {
@@ -108,14 +182,14 @@ fn huffman_decode(data[]u8) string {
 	mut result :=[]u8{}
 	mut pos := 0
 	for _ in 0 .. nchars {
-		mut code := 0
+		mut code := u32(0)
 		mut found := false
 		for l in 1 .. 9 {
 			if pos >= bits.len { break }
-			code = (code << 1) | int(bits[pos])
+			code = (code << 1) | u32(bits[pos])
 			pos++
-			if l >= 3 && code >= fc[l] && code - fc[l] < cn[l] {
-				result << syms[fo[l] + code - fc[l]]
+			if l >= 3 && int(code) >= fc[l] && int(code) - fc[l] < cn[l] {
+				result << syms[fo[l] + int(code) - fc[l]]
 				found = true
 				break
 			}
@@ -271,7 +345,7 @@ fn get_local_ip(dns_ip string)[]u8 {
 
 fn resolve_udp(host string) !i64 {
 	$if windows { return error('udp resolve not implemented on windows') }
-
+	
 	mut sa := C.sockaddr_in{}
 	sa.sin_family = u16(C.AF_INET)
 	sa.sin_port = C.htons(53)
@@ -392,89 +466,51 @@ fn die(s string) {
 	exit(1)
 }
 
-fn send_byte(base string, byte_idx int, ch u8) {
-	ts := get_ts()
-	for bit in 0 .. 8 {
-		idx := byte_idx * 8 + bit
-		b := u8((ch >> (7 - bit)) & 1)
+fn send_bits(base string, prefix string, start_idx int, bits []u8, deadline i64, cts i64) bool {
+	for i, b in bits {
+		if get_ts() > deadline { return false }
+		idx := start_idx + i
 		if b == 0 {
-			for _ in 0 .. 5 {
-				resolve('${idx}${ts}.${base}') or {}
-				resolve('v${idx}${ts}.${base}') or {}
-				resolve('w${idx}${ts}.${base}') or {}
-			}
+			resolve('${prefix}${idx}${cts}.${base}') or {}
+			resolve('v${prefix}${idx}${cts}.${base}') or {}
+			resolve('w${prefix}${idx}${cts}.${base}') or {}
 		}
 	}
+	return true
 }
 
-fn send_mode(base string, msg string) {
-	resolve('c0.${base}') or {}
-	time.sleep(50 * time.millisecond)
-	resolve('c0.${base}') or {}
+fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, deadline i64, cts i64) ![]u8 {
+	mut res := []u8{}
+	for i in 0 .. num_bits {
+		if get_ts() > deadline { return error('deadline exceeded') }
+		idx := start_idx + i
+		
+		t1 := resolve_safe('${prefix}${idx}${cts}.${base}')
+		t2 := resolve_safe('v${prefix}${idx}${cts}.${base}')
+		t3 := resolve_safe('w${prefix}${idx}${cts}.${base}')
 
-	data, filtered := huffman_encode(msg)
-
-	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
-	println('[tx] ${data.len} wire bytes (huffman)')
-	if g_dns == "" { println('[tx] receiver cmd:  dnsh rec ${base} ${data.len}') }
-	else { println('[tx] receiver cmd:  sudo ./dnsh --dns ${g_dns} rec ${base} ${data.len}') }
-	println('[tx] sending with ${g_workers} workers...')
-
-	mut pos := 0
-	for pos < data.len {
-		mut end := pos + g_workers
-		if end > data.len { end = data.len }
-		mut threads :=[]thread{}
-		for i in pos .. end {
-			threads << spawn send_byte(base, i, data[i])
-		}
-		threads.wait()
-		time.sleep(50 * time.millisecond)
-		pos = end
+		mut t := t1
+		if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
+		if t3 >= 0 && (t < 0 || t3 < t) { t = t3 }
+		
+		if t < 0 { return error('bit read failed') }
+		res << (if t <= thr { u8(0) } else { u8(1) })
 	}
-
-	mut zeros := 0
-	for ch in data {
-		for bit in 0 .. 8 {
-			if ((ch >> (7 - bit)) & 1) == 0 { zeros++ }
-		}
-	}
-
-	println('[tx] cached ${zeros} subdomains')
-	println('[tx] keepalive running... (ctrl+c to stop)\n')
-	
-	mut round := 0
-	for {
-		ts := get_ts()
-		round++
-		mut refreshed := 0
-		for i in 0 .. data.len {
-			ch := data[i]
-			for bit in 0 .. 8 {
-				idx := i * 8 + bit
-				if ((ch >> (7 - bit)) & 1) == 0 {
-					resolve('${idx}${ts}.${base}') or {}
-					time.sleep(20 * time.millisecond)
-					resolve('v${idx}${ts}.${base}') or {}
-					time.sleep(20 * time.millisecond)
-					resolve('w${idx}${ts}.${base}') or {}
-					time.sleep(20 * time.millisecond)
-					refreshed++
-				}
-			}
-		}
-		println('[keepalive #${round}] ${refreshed} entries refreshed')
-		time.sleep(5 * time.second)
-	}
+	return res
 }
 
-fn rec_mode(base string, nbytes int) {
-	println('[rx] reading ${nbytes} wire bytes (huffman)...\n')
-	println('[rx] calibrating...')
+fn simple_hash(data []u8) u8 {
+	mut h := u32(0)
+	for b in data {
+		h = (h * 31) + u32(b)
+	}
+	return u8(h & 0xFF)
+}
 
+fn calibrate(base string) !i64 {
+	println('[*] calibrating...')
 	mut fast_arr := []i64{}
-	mut slow_arr :=[]i64{}
-
+	mut slow_arr := []i64{}
 	for _ in 0 .. 5 {
 		f := resolve_safe('c0.${base}')
 		if f >= 0 { fast_arr << f }
@@ -485,58 +521,298 @@ fn rec_mode(base string, nbytes int) {
 		if s >= 0 { slow_arr << s }
 		time.sleep(50 * time.millisecond)
 	}
-
-	if fast_arr.len < 3 || slow_arr.len < 3 { die('calibration failed') }
-
+	if fast_arr.len < 3 || slow_arr.len < 3 { return error('calibration failed') }
 	fast_arr.sort()
 	slow_arr.sort()
 	fast_med := fast_arr[fast_arr.len / 2]
 	slow_med := slow_arr[slow_arr.len / 2]
 	gap := slow_med - fast_med
-
-	if gap < 1000 {
-		die('gap ${gap}µs too small (fast:${fast_med}µs slow:${slow_med}µs) - sender running?')
-	}
-
+	if gap < 1000 { return error('gap too small') }
 	mut thr := ((fast_med + slow_med + gap) / 3) - 500
 	if thr < 1000 { thr = 1000 }
+	println('[*] calibrated threshold: ${thr}µs')
+	return thr
+}
 
-	println('[rx] fast:${fast_med}µs slow:${slow_med}µs gap:${gap}µs thr:${thr}µs\n')
+fn bits_to_int(bits []u8) u32 {
+	mut val := u32(0)
+	for b in bits {
+		val = (val << 1) | u32(b)
+	}
+	return val
+}
 
-	mut out :=[]u8{}
-	mut bit_idx := 0
-	ts := get_ts()
+fn int_to_bits(val int, num_bits int) []u8 {
+	mut res := []u8{len: num_bits}
+	for i in 0 .. num_bits {
+		res[num_bits - 1 - i] = u8((val >> i) & 1)
+	}
+	return res
+}
 
-	for i in 0 .. nbytes {
-		mut ch := u8(0)
-		mut ts_arr :=[]i64{}
-		
-		for _ in 0 .. 8 {
-			time.sleep(10 * time.millisecond)
-			t1 := resolve_safe('${bit_idx}${ts}.${base}')
-			t2 := resolve_safe('v${bit_idx}${ts}.${base}')
-			t3 := resolve_safe('w${bit_idx}${ts}.${base}')
+fn send_mode(base string, msg string) {
+	thr := calibrate(base) or { die('calibration failed') }
+	
+	mut raw_data, filtered := huffman_encode(msg)
+	h := simple_hash(raw_data)
+	
+	mut data := []u8{}
+	data << h
+	data << raw_data
+	// Append AA AA (magic_eom)
+	data << u8(magic_eom >> 8)
+	data << u8(magic_eom & 0xFF)
 
-			mut t := t1
-			if t2 >= 0 && (t < 0 || t2 < t) { t = t2 }
-			if t3 >= 0 && (t < 0 || t3 < t) { t = t3 }
-			if t < 0 { die('bit ${bit_idx} failed') }
-
-			ts_arr << t
-			ch = (ch << 1) | (if t <= thr { u8(0) } else { u8(1) })
-			bit_idx++
-		}
-
-		out << ch
-		if ch.hex() == "ff" {
-			bit_idx += nbytes
-			unsafe { i = 0 }
-		}
-		println('  byte #${i}  ${ts_arr}µs  ->  0x${ch.hex()}')
+	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
+	println('[tx] Hash: ${h:02X}')
+	println('[tx] ${data.len} total wire bytes (incl. Hash + EOM)')
+	println('[tx] chunk size: ${g_chunk_size}')
+	
+	pi_check := get_phase_info()
+	wire_chunk_size := 1 + g_chunk_size + 2
+	
+	estimated_bits := wire_chunk_size * 8
+	estimated_time := i64(estimated_bits) * 350
+	if estimated_time > pi_check.t1_len {
+		die('Window too small for chunk size ${g_chunk_size}. T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
 	}
 
-	decoded := huffman_decode(out)
-	println('\n[rx] "${decoded}"')
+	mut pos := 0
+	mut chunk_idx := u8(0)
+	mut resending := false
+	for pos < data.len {
+		pi := wait_for_phase(0) // Wait for T1
+		cts := pi.cycle_start / 1000
+		
+		mut end := pos + g_chunk_size
+		if end > data.len { end = data.len }
+		
+		mut chunk := []u8{}
+		chunk << chunk_idx
+		chunk << data[pos..end]
+		// Padding
+		for chunk.len < 1 + g_chunk_size { chunk << u8(0) }
+		
+		if end < data.len {
+			chunk << u8(magic_chunk_end >> 8)
+			chunk << u8(magic_chunk_end & 0xFF)
+		} else {
+			chunk << u8(magic_eom >> 8)
+			chunk << u8(magic_eom & 0xFF)
+		}
+		
+		if resending {
+			println('[tx] Resending chunk #${chunk_idx} [${pos}..${end}]')
+		} else {
+			println('[tx] Sending chunk #${chunk_idx} [${pos}..${end}]')
+		}
+		
+		mut chunk_bits := []u8{}
+		for b in chunk {
+			chunk_bits << int_to_bits(int(b), 8)
+		}
+		
+		if !send_bits(base, "d", 0, chunk_bits, pi.phase_end, cts) {
+			println('[!] T1 timeout, chunk might be incomplete')
+		}
+		
+		// TK window
+		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
+		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
+		send_bits(base, "s", 0, int_to_bits(status_ok, 4), tk_mid, cts_tk)
+		
+		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
+		
+		mut status := u32(0)
+		mut got_status := false
+		for _ in 0 .. 3 {
+			status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { continue }
+			status = bits_to_int(status_bits)
+			if status != 0b1111 {
+				got_status = true
+				break
+			}
+		}
+		
+		if got_status {
+			println('[tx] Receiver status: ${status:04b}')
+			if status == status_stop {
+				println('[tx] Receiver requested stop. Confirming.')
+				break
+			}
+			if status == status_success || status == status_ok || status == status_start || status == status_success_n {
+				pos = end
+				chunk_idx++
+				resending = false
+			} else {
+				println('[tx] Receiver reported error. Will resend.')
+				resending = true
+			}
+		} else {
+			println('[tx] No status/No signal from receiver.')
+			resending = true 
+		}
+	}
+	
+	println('[tx] Entering final termination handshake...')
+	for attempt in 0 .. 10 {
+		println('[tx] Termination handshake attempt #${attempt+1}...')
+		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
+		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
+		
+		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
+		status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { []u8{} }
+		if status_bits.len == 4 {
+			status := bits_to_int(status_bits)
+			if status == status_stop {
+				println('[tx] Received STOP. Sending CONFIRM.')
+				pi_tk_next := wait_for_phase(2)
+				cts_tk_next := pi_tk_next.cycle_start / 1000
+				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
+				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next, cts_tk_next)
+				println('[tx] Termination confirmed. Done.')
+				return
+			}
+		}
+		time.sleep(500 * time.millisecond)
+	}
+}
+
+fn rec_mode(base string) {
+	thr := calibrate(base) or { die('calibration failed') }
+	pi_check := get_phase_info()
+	wire_chunk_size := 1 + g_chunk_size + 2
+	estimated_bits := wire_chunk_size * 8
+	estimated_time := i64(estimated_bits) * 550
+	if estimated_time > pi_check.t2_len {
+		die('Window too small for chunk size ${g_chunk_size}. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
+	}
+
+	mut expected_hash := u8(0)
+	mut hash_received := false
+	mut final_data := []u8{}
+	mut finished := false
+	mut last_accepted_idx := -1
+
+	for !finished {
+		pi := wait_for_phase(1) // Wait for T2
+		cts := pi.cycle_start / 1000
+		println('[rx] Cycle start, reading chunk...')
+		
+		num_bits := wire_chunk_size * 8
+		
+		mut success := true
+		bits := read_bits(base, "d", 0, num_bits, thr, pi.phase_end, cts) or {
+			println('[!] T2 timeout or read failure')
+			success = false
+			[]u8{}
+		}
+		
+		if success && bits.len == num_bits {
+			mut chunk_full := []u8{}
+			for i in 0 .. wire_chunk_size {
+				chunk_full << u8(bits_to_int(bits[i*8 .. (i+1)*8]))
+			}
+			
+			chunk_idx := int(chunk_full[0])
+			terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
+			payload := chunk_full[1..wire_chunk_size-2].clone()
+			
+			if terminator == magic_chunk_end || terminator == magic_eom {
+				println('[rx] Chunk #${chunk_idx} valid (terminator: ${terminator:04X})')
+				
+				if chunk_idx > last_accepted_idx {
+					mut chunk_data := payload.clone()
+					
+					if !hash_received {
+						expected_hash = chunk_data[0]
+						chunk_data = chunk_data[1..].clone()
+						hash_received = true
+						println('[rx] Received message hash: ${expected_hash:02X}')
+					}
+					
+					if terminator == magic_eom {
+						finished = true
+					}
+					
+					final_data << chunk_data
+					last_accepted_idx = chunk_idx
+					println('[rx] Chunk accepted.')
+				} else {
+					println('[rx] Chunk #${chunk_idx} already accepted, skipping.')
+				}
+			} else {
+				println('[rx] Invalid chunk terminator: ${terminator:04X}')
+				success = false
+			}
+		} else {
+			success = false
+		}
+		
+		t2_start := pi.cycle_start + pi.t1_len
+		t2_third := pi.t2_len / 3
+		status_report_time := t2_start + 2 * t2_third
+		
+		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
+		
+		status_val := if success { status_success } else { status_error }
+		send_bits(base, "r", 0, int_to_bits(status_val, 4), pi.phase_end, cts)
+		
+		// TK window
+		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
+		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
+		
+		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
+		
+		tk_status := if success { status_start } else { status_error }
+		send_bits(base, "r", 0, int_to_bits(tk_status, 4), pi_tk.phase_end, cts_tk)
+		
+		if !success {
+			println('[rx] Error reported. Expecting retransmission.')
+		}
+	}
+	
+	actual_hash := simple_hash(final_data)
+	if actual_hash != expected_hash {
+		println('[!] Hash mismatch! Expected: ${expected_hash:02X}, Actual: ${actual_hash:02X}')
+	} else {
+		println('[rx] Hash verified successfully.')
+	}
+
+	decoded := huffman_decode(final_data)
+	println('\n[rx] Final message: "${decoded}"')
+	
+	println('[rx] Entering termination handshake...')
+	for _ in 0 .. 5 {
+		pi := wait_for_phase(1)
+		cts := pi.cycle_start / 1000
+		
+		t2_start := pi.cycle_start + pi.t1_len
+		t2_third := pi.t2_len / 3
+		status_report_time := t2_start + 2 * t2_third
+		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
+		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi.phase_end, cts)
+		
+		// TK window
+		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
+		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
+		
+		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts_tk) or { []u8{} }
+		if conf_bits.len == 4 {
+			conf_val := bits_to_int(conf_bits)
+			if conf_val == status_confirm_stop {
+				println('[rx] Sender confirmed stop. Terminating.')
+				break
+			}
+		}
+		
+		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
+		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi_tk.phase_end, cts_tk)
+	}
 }
 
 fn main() {
@@ -554,6 +830,14 @@ fn main() {
 			window = os.args[i + 1].int()
 			if window < 1 { window = 1 }
 			i += 2
+		} else if os.args[i] == '--chunk-size' && i + 1 < os.args.len {
+			g_chunk_size = os.args[i + 1].int()
+			if g_chunk_size < 1 { g_chunk_size = 1 }
+			i += 2
+		} else if os.args[i] == '--tk-len' && i + 1 < os.args.len {
+			g_tk_len = os.args[i + 1].int()
+			if g_tk_len < 1 { g_tk_len = 1 }
+			i += 2
 		} else {
 			args << os.args[i]
 			i += 1
@@ -563,9 +847,9 @@ fn main() {
 	if g_dns.len > 0 { println('[*] dns server: ${g_dns}') }
 
 	if args.len < 1 {
-		eprintln('dnsh [--dns SERVER] [--workers N] <send|rec> [domain] [msg|bytes]')
+		eprintln('dnsh [--dns SERVER] [--workers N] [--window SEC] [--chunk-size N] [--tk-len N] <send|rec> [domain] [msg]')
 		eprintln('  sudo ./dnsh --dns 8.8.8.8 send x.com "hello world"')
-		eprintln('  sudo ./dnsh --dns 8.8.8.8 rec  x.com 7')
+		eprintln('  sudo ./dnsh --dns 8.8.8.8 rec  x.com')
 		exit(1)
 	}
 	match args[0] {
@@ -576,8 +860,7 @@ fn main() {
 		}
 		'rec' {
 			d := if args.len > 1 { args[1] } else { 'x.com' }
-			n := if args.len > 2 { args[2].int() } else { 3 }
-			rec_mode(d, n)
+			rec_mode(d)
 		}
 		else { die('send or rec') }
 	}
