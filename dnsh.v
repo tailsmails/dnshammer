@@ -468,9 +468,7 @@ fn die(s string) {
 	exit(1)
 }
 
-fn send_bits(base string, prefix string, start_idx int, bits []u8, deadline i64) bool {
-	pi := get_phase_info()
-	cts := pi.cycle_start / 1000
+fn send_bits(base string, prefix string, start_idx int, bits []u8, deadline i64, cts i64) bool {
 	for i, b in bits {
 		if get_ts() > deadline { return false }
 		idx := start_idx + i
@@ -483,11 +481,8 @@ fn send_bits(base string, prefix string, start_idx int, bits []u8, deadline i64)
 	return true
 }
 
-fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, deadline i64) ![]u8 {
+fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, deadline i64, cts i64) ![]u8 {
 	mut res := []u8{}
-	pi := get_phase_info()
-	cts := pi.cycle_start / 1000
-
 	for i in 0 .. num_bits {
 		if get_ts() > deadline { return error('deadline exceeded') }
 		idx := start_idx + i
@@ -504,6 +499,33 @@ fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, d
 		res << (if t <= thr { u8(0) } else { u8(1) })
 	}
 	return res
+}
+
+fn calibrate(base string) !i64 {
+	println('[*] calibrating...')
+	mut fast_arr := []i64{}
+	mut slow_arr := []i64{}
+	for _ in 0 .. 5 {
+		f := resolve_safe('c0.${base}')
+		if f >= 0 { fast_arr << f }
+		time.sleep(50 * time.millisecond)
+	}
+	for _ in 0 .. 5 {
+		s := resolve_safe('u${rand.intn(99999) or { 12345 }}.${base}')
+		if s >= 0 { slow_arr << s }
+		time.sleep(50 * time.millisecond)
+	}
+	if fast_arr.len < 3 || slow_arr.len < 3 { return error('calibration failed') }
+	fast_arr.sort()
+	slow_arr.sort()
+	fast_med := fast_arr[fast_arr.len / 2]
+	slow_med := slow_arr[slow_arr.len / 2]
+	gap := slow_med - fast_med
+	if gap < 1000 { return error('gap too small') }
+	mut thr := ((fast_med + slow_med + gap) / 3) - 500
+	if thr < 1000 { thr = 1000 }
+	println('[*] calibrated threshold: ${thr}µs')
+	return thr
 }
 
 fn bits_to_int(bits []u8) u32 {
@@ -523,6 +545,8 @@ fn int_to_bits(val int, num_bits int) []u8 {
 }
 
 fn send_mode(base string, msg string) {
+	thr := calibrate(base) or { die('calibration failed') }
+
 	mut data, filtered := huffman_encode(msg)
 	// Append AA AA (magic_eom)
 	data << u8(magic_eom >> 8)
@@ -544,6 +568,7 @@ fn send_mode(base string, msg string) {
 	mut resending := false
 	for pos < data.len {
 		pi := wait_for_phase(0) // Wait for T1
+		cts := pi.cycle_start / 1000
 
 		mut end := pos + g_chunk_size
 		if end > data.len { end = data.len }
@@ -561,34 +586,25 @@ fn send_mode(base string, msg string) {
 		}
 
 		// Send data bits in T1
-		if !send_bits(base, "d", 0, chunk_bits, pi.phase_end) {
+		if !send_bits(base, "d", 0, chunk_bits, pi.phase_end, cts) {
 			println('[!] T1 timeout, chunk might be incomplete')
 		}
 
 		// TK window
 		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
 		// Sender transmits in first half of TK
-		// User: "If the sender requests a retransmission, the receiver responds with '1010' (OK)."
-		// This is confusing, but let's send a ping/status.
-		send_bits(base, "s", 0, int_to_bits(status_ok, 4), tk_mid)
+		send_bits(base, "s", 0, int_to_bits(status_ok, 4), tk_mid, cts_tk)
 
 		// Read from receiver's domain in second half of TK
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 
-		// We need a threshold. Receiver should have calibrated it.
-		// Sender can calibrate too or use a fixed one if environment is stable.
-		// Let's assume sender doesn't have a good threshold unless it calibrates.
-		// For now, use a heuristic or re-calibrate?
-		// Since we don't have receiver's thr, let's use a safe value or
-		// try to read multiple times.
-		thr := i64(5000)
-
 		mut status := u32(0)
 		mut got_status := false
 		for _ in 0 .. 3 {
-			status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end) or {
+			status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or {
 				continue
 			}
 			status = bits_to_int(status_bits)
@@ -605,10 +621,11 @@ fn send_mode(base string, msg string) {
 			println('[tx] Receiver status: ${status:04b}')
 			if status == status_stop {
 				println('[tx] Receiver requested stop. Confirming and terminating.')
-				// Confirm in first half of next TK (or current if still in TK, but we are at end of TK)
+				// Confirm in first half of next TK
 				pi_tk_next := wait_for_phase(2)
+				cts_tk_next := pi_tk_next.cycle_start / 1000
 				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
-				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next)
+				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next, cts_tk_next)
 				return
 			}
 			if status == status_success || status == status_ok || status == status_start {
@@ -620,8 +637,6 @@ fn send_mode(base string, msg string) {
 			}
 		} else {
 			println('[tx] No status received from receiver.')
-			// If no status, wait or proceed? User said: "If the sender does not receive '1010' ... it takes no action and waits"
-			// Wait means resend/stay at current pos.
 			resending = true
 		}
 	}
@@ -629,29 +644,7 @@ fn send_mode(base string, msg string) {
 }
 
 fn rec_mode(base string) {
-	println('[rx] calibrating...')
-	mut fast_arr := []i64{}
-	mut slow_arr := []i64{}
-	for _ in 0 .. 5 {
-		f := resolve_safe('c0.${base}')
-		if f >= 0 { fast_arr << f }
-		time.sleep(50 * time.millisecond)
-	}
-	for _ in 0 .. 5 {
-		s := resolve_safe('u${rand.intn(99999) or { 12345 }}.${base}')
-		if s >= 0 { slow_arr << s }
-		time.sleep(50 * time.millisecond)
-	}
-	if fast_arr.len < 3 || slow_arr.len < 3 { die('calibration failed') }
-	fast_arr.sort()
-	slow_arr.sort()
-	fast_med := fast_arr[fast_arr.len / 2]
-	slow_med := slow_arr[slow_arr.len / 2]
-	gap := slow_med - fast_med
-	if gap < 1000 { die('gap too small') }
-	mut thr := ((fast_med + slow_med + gap) / 3) - 500
-	if thr < 1000 { thr = 1000 }
-	println('[rx] thr:${thr}µs\n')
+	thr := calibrate(base) or { die('calibration failed') }
 
 	// Pre-transmission check
 	pi_check := get_phase_info()
@@ -666,12 +659,13 @@ fn rec_mode(base string) {
 
 	for !finished {
 		pi := wait_for_phase(1) // Wait for T2
+		cts := pi.cycle_start / 1000
 		println('[rx] Cycle start, reading chunk...')
-		
+
 		num_bits := g_chunk_size * 8
 
 		mut success := true
-		bits := read_bits(base, "d", 0, num_bits, thr, pi.phase_end) or {
+		bits := read_bits(base, "d", 0, num_bits, thr, pi.phase_end, cts) or {
 			println('[!] T2 timeout or read failure')
 			success = false
 			[]u8{}
@@ -715,20 +709,18 @@ fn rec_mode(base string) {
 		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
 
 		status_val := if success { status_success } else { status_error }
-		send_bits(base, "r", 0, int_to_bits(status_val, 4), pi.phase_end)
+		send_bits(base, "r", 0, int_to_bits(status_val, 4), pi.phase_end, cts)
 
 		// TK window
 		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-
-		// Receiver reads in first half of TK
-		// (Optional: can read sender status)
 
 		// Receiver transmits in second half of TK
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 
 		tk_status := if success { status_start } else { status_error }
-		send_bits(base, "r", 0, int_to_bits(tk_status, 4), pi_tk.phase_end)
+		send_bits(base, "r", 0, int_to_bits(tk_status, 4), pi_tk.phase_end, cts_tk)
 
 		if !success {
 			println('[rx] Error reported. Expecting retransmission.')
@@ -741,22 +733,22 @@ fn rec_mode(base string) {
 	println('[rx] Entering termination handshake...')
 	for _ in 0 .. 5 { // Attempt handshake for a few cycles
 		pi := wait_for_phase(1)
+		cts := pi.cycle_start / 1000
 
 		// Report STOP status in final third of T2
 		t2_start := pi.cycle_start + pi.t1_len
 		t2_third := pi.t2_len / 3
 		status_report_time := t2_start + 2 * t2_third
 		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi.phase_end)
+		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi.phase_end, cts)
 
 		// TK window
 		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
 		// Read sender's confirmation in first half of TK
-		// Use a safe threshold
-		thr_tk := i64(5000)
-		conf_bits := read_bits(base, "s", 0, 4, thr_tk, tk_mid) or { []u8{} }
+		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts_tk) or { []u8{} }
 		if conf_bits.len == 4 {
 			conf_val := bits_to_int(conf_bits)
 			if conf_val == status_confirm_stop {
@@ -767,7 +759,7 @@ fn rec_mode(base string) {
 
 		// Also transmit STOP in second half of TK just in case
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi_tk.phase_end)
+		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi_tk.phase_end, cts_tk)
 	}
 }
 
