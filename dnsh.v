@@ -50,6 +50,7 @@ __global g_fallback_notified = false
 const magic_eof = u16(0xFFFF)
 const magic_no_signal = u16(0x0000)
 const magic_eom = u16(0xAAAA)
+const magic_chunk_end = u16(0xEEEE)
 
 const status_success = 0b0110
 const status_error = 0b1001
@@ -501,6 +502,14 @@ fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, d
 	return res
 }
 
+fn simple_hash(data []u8) u8 {
+	mut h := u32(0)
+	for b in data {
+		h = (h * 31) + u32(b)
+	}
+	return u8(h & 0xFF)
+}
+
 fn calibrate(base string) !i64 {
 	println('[*] calibrating...')
 	mut fast_arr := []i64{}
@@ -547,21 +556,31 @@ fn int_to_bits(val int, num_bits int) []u8 {
 fn send_mode(base string, msg string) {
 	thr := calibrate(base) or { die('calibration failed') }
 
-	mut data, filtered := huffman_encode(msg)
+	mut raw_data, filtered := huffman_encode(msg)
+	h := simple_hash(raw_data)
+
+	mut data := []u8{}
+	data << h
+	data << raw_data
 	// Append AA AA (magic_eom)
 	data << u8(magic_eom >> 8)
 	data << u8(magic_eom & 0xFF)
 
 	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
-	println('[tx] ${data.len} total wire bytes (incl. EOM)')
+	println('[tx] Hash: ${h:02X}')
+	println('[tx] ${data.len} total wire bytes (incl. Hash + EOM)')
 	println('[tx] chunk size: ${g_chunk_size}')
 
 	// Pre-transmission check
 	pi_check := get_phase_info()
-	estimated_bits := g_chunk_size * 8
-	estimated_time := i64(estimated_bits) * 300 // 300ms per bit estimate
+	// Each chunk will have 2 extra bytes (EEEE) unless it's the last part.
+	// Actually, let's just make the chunk size fixed and append EEEE to EACH chunk's worth of data.
+	// User said: "use 'EEEE' as the terminator for each individual chunk, and 'AAAA' for the final end-of-message signal"
+
+	estimated_bits := (g_chunk_size + 2) * 8
+	estimated_time := i64(estimated_bits) * 350 // Slightly more conservative
 	if estimated_time > pi_check.t1_len {
-		die('Window too small for chunk size ${g_chunk_size}. T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
+		die('Window too small for chunk size ${g_chunk_size} + 2 (EEEE). T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
 	}
 
 	mut pos := 0
@@ -572,12 +591,23 @@ fn send_mode(base string, msg string) {
 
 		mut end := pos + g_chunk_size
 		if end > data.len { end = data.len }
-		chunk := data[pos..end].clone()
+		mut chunk := data[pos..end].clone()
+
+		// Append EEEE or AAAA?
+		// "EEEE as the terminator for each individual chunk, and AAAA for the final end-of-message signal"
+		// If it's the last chunk of 'data' (which already contains EOM), we don't need another EEEE?
+		// But let's follow strictly:
+		if end < data.len {
+			chunk << u8(magic_chunk_end >> 8)
+			chunk << u8(magic_chunk_end & 0xFF)
+		} else {
+			// AAAA is already at the end of data if this is the final part.
+		}
 
 		if resending {
-			println('[tx] Resending chunk [${pos}..${end}]')
+			println('[tx] Resending chunk [${pos}..${end}] (${chunk.len} bytes on wire)')
 		} else {
-			println('[tx] Sending chunk [${pos}..${end}]')
+			println('[tx] Sending chunk [${pos}..${end}] (${chunk.len} bytes on wire)')
 		}
 
 		mut chunk_bits := []u8{}
@@ -585,7 +615,6 @@ fn send_mode(base string, msg string) {
 			chunk_bits << int_to_bits(int(b), 8)
 		}
 
-		// Send data bits in T1
 		if !send_bits(base, "d", 0, chunk_bits, pi.phase_end, cts) {
 			println('[!] T1 timeout, chunk might be incomplete')
 		}
@@ -598,49 +627,66 @@ fn send_mode(base string, msg string) {
 		// Sender transmits in first half of TK
 		send_bits(base, "s", 0, int_to_bits(status_ok, 4), tk_mid, cts_tk)
 
-		// Read from receiver's domain in second half of TK
+		// Read status from receiver
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 
 		mut status := u32(0)
 		mut got_status := false
 		for _ in 0 .. 3 {
-			status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or {
-				continue
-			}
+			status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { continue }
 			status = bits_to_int(status_bits)
-			got_status = true
-			break
+			if status != 0b1111 {
+				got_status = true
+				break
+			}
 		}
 
 		if got_status {
-			if status == 0b1111 {
-				println('[tx] No signal from receiver (0b1111).')
-				resending = true
-				continue
-			}
 			println('[tx] Receiver status: ${status:04b}')
 			if status == status_stop {
-				println('[tx] Receiver requested stop. Confirming and terminating.')
-				// Confirm in first half of next TK
-				pi_tk_next := wait_for_phase(2)
-				cts_tk_next := pi_tk_next.cycle_start / 1000
-				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
-				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next, cts_tk_next)
-				return
+				println('[tx] Receiver requested stop. Confirming.')
+				break
 			}
 			if status == status_success || status == status_ok || status == status_start {
 				pos = end
 				resending = false
-			} else if status == status_error {
+			} else {
 				println('[tx] Receiver reported error. Will resend.')
 				resending = true
 			}
 		} else {
-			println('[tx] No status received from receiver.')
+			println('[tx] No status/No signal from receiver.')
 			resending = true
 		}
 	}
-	println('[tx] Done.')
+
+	println('[tx] Entering final termination handshake...')
+	for {
+		pi_tk := wait_for_phase(2)
+		cts_tk := pi_tk.cycle_start / 1000
+		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
+
+		// Check for STOP from receiver in T2 window of next cycle
+		// Wait for next cycle's TK to read what was reported in T2
+
+		// Read receiver status
+		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
+		status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { []u8{} }
+		if status_bits.len == 4 {
+			status := bits_to_int(status_bits)
+			if status == status_stop {
+				println('[tx] Received STOP. Sending CONFIRM.')
+				// Need to send confirm in first half of TK. Wait for NEXT TK.
+				pi_tk_next := wait_for_phase(2)
+				cts_tk_next := pi_tk_next.cycle_start / 1000
+				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
+				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next, cts_tk_next)
+				println('[tx] Termination confirmed. Done.')
+				return
+			}
+		}
+		time.sleep(500 * time.millisecond)
+	}
 }
 
 fn rec_mode(base string) {
@@ -648,12 +694,15 @@ fn rec_mode(base string) {
 
 	// Pre-transmission check
 	pi_check := get_phase_info()
-	estimated_bits := g_chunk_size * 8
-	estimated_time := i64(estimated_bits) * 500 // 500ms per bit estimate for receiver
+	// Receiver reads g_chunk_size + 2 (EEEE/AAAA)
+	estimated_bits := (g_chunk_size + 2) * 8
+	estimated_time := i64(estimated_bits) * 550 // Slightly more conservative for receiver
 	if estimated_time > pi_check.t2_len {
-		die('Window too small for chunk size ${g_chunk_size}. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
+		die('Window too small for chunk size ${g_chunk_size} + 2. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
 	}
 
+	mut expected_hash := u8(0)
+	mut hash_received := false
 	mut final_data := []u8{}
 	mut finished := false
 
@@ -662,7 +711,8 @@ fn rec_mode(base string) {
 		cts := pi.cycle_start / 1000
 		println('[rx] Cycle start, reading chunk...')
 
-		num_bits := g_chunk_size * 8
+		// Chunk includes data + terminator (EEEE or AAAA)
+		num_bits := (g_chunk_size + 2) * 8
 
 		mut success := true
 		bits := read_bits(base, "d", 0, num_bits, thr, pi.phase_end, cts) or {
@@ -671,31 +721,36 @@ fn rec_mode(base string) {
 			[]u8{}
 		}
 
-		mut chunk_bytes := []u8{}
+		mut chunk_full := []u8{}
 		if success && bits.len == num_bits {
-			for i in 0 .. g_chunk_size {
+			for i in 0 .. (g_chunk_size + 2) {
 				b := u8(bits_to_int(bits[i*8 .. (i+1)*8]))
-				chunk_bytes << b
+				chunk_full << b
 			}
 
-			// Check for magic bytes or errors
-			for i in 0 .. chunk_bytes.len - 1 {
-				val := (u16(chunk_bytes[i]) << 8) | u16(chunk_bytes[i+1])
-				if val == magic_eof || val == magic_no_signal {
-					println('[rx] Termination signal detected: ${val:04X}')
-					finished = true
-					break
-				}
-				if val == magic_eom {
-					println('[rx] EOM detected')
-					finished = true
-					break
-				}
-			}
+			// Extract terminator
+			terminator := (u16(chunk_full[chunk_full.len - 2]) << 8) | u16(chunk_full[chunk_full.len - 1])
+			mut chunk_data := chunk_full[..chunk_full.len-2].clone()
 
-			if success {
-				final_data << chunk_bytes
-				println('[rx] Chunk received successfully: ${chunk_bytes.hex()}')
+			if terminator == magic_chunk_end || terminator == magic_eom {
+				println('[rx] Chunk terminator valid: ${terminator:04X}')
+				if terminator == magic_eom {
+					finished = true
+				}
+
+				// Handle hash if first chunk
+				if !hash_received {
+					expected_hash = chunk_data[0]
+					chunk_data = chunk_data[1..].clone()
+					hash_received = true
+					println('[rx] Received message hash: ${expected_hash:02X}')
+				}
+
+				final_data << chunk_data
+				println('[rx] Chunk accepted: ${chunk_data.hex()}')
+			} else {
+				println('[rx] Invalid chunk terminator: ${terminator:04X}')
+				success = false
 			}
 		} else {
 			success = false
@@ -725,6 +780,15 @@ fn rec_mode(base string) {
 		if !success {
 			println('[rx] Error reported. Expecting retransmission.')
 		}
+	}
+
+	// Verify final hash
+	actual_hash := simple_hash(final_data)
+	if actual_hash != expected_hash {
+		println('[!] Hash mismatch! Expected: ${expected_hash:02X}, Actual: ${actual_hash:02X}')
+		// Even if hash mismatches, we show what we got
+	} else {
+		println('[rx] Hash verified successfully.')
 	}
 
 	decoded := huffman_decode(final_data)
