@@ -55,6 +55,8 @@ const status_success = 0b0110
 const status_error = 0b1001
 const status_ok = 0b1010
 const status_start = 0b1100
+const status_stop = 0b0001
+const status_confirm_stop = 0b1000
 
 fn get_ts() i64 {
 	return time.now().unix_milli()
@@ -595,7 +597,20 @@ fn send_mode(base string, msg string) {
 		}
 
 		if got_status {
+			if status == 0b1111 {
+				println('[tx] No signal from receiver (0b1111).')
+				resending = true
+				continue
+			}
 			println('[tx] Receiver status: ${status:04b}')
+			if status == status_stop {
+				println('[tx] Receiver requested stop. Confirming and terminating.')
+				// Confirm in first half of next TK (or current if still in TK, but we are at end of TK)
+				pi_tk_next := wait_for_phase(2)
+				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
+				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next)
+				return
+			}
 			if status == status_success || status == status_ok || status == status_start {
 				pos = end
 				resending = false
@@ -722,6 +737,38 @@ fn rec_mode(base string) {
 
 	decoded := huffman_decode(final_data)
 	println('\n[rx] Final message: "${decoded}"')
+
+	println('[rx] Entering termination handshake...')
+	for _ in 0 .. 5 { // Attempt handshake for a few cycles
+		pi := wait_for_phase(1)
+
+		// Report STOP status in final third of T2
+		t2_start := pi.cycle_start + pi.t1_len
+		t2_third := pi.t2_len / 3
+		status_report_time := t2_start + 2 * t2_third
+		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
+		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi.phase_end)
+
+		// TK window
+		pi_tk := wait_for_phase(2)
+		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
+
+		// Read sender's confirmation in first half of TK
+		// Use a safe threshold
+		thr_tk := i64(5000)
+		conf_bits := read_bits(base, "s", 0, 4, thr_tk, tk_mid) or { []u8{} }
+		if conf_bits.len == 4 {
+			conf_val := bits_to_int(conf_bits)
+			if conf_val == status_confirm_stop {
+				println('[rx] Sender confirmed stop. Terminating.')
+				break
+			}
+		}
+
+		// Also transmit STOP in second half of TK just in case
+		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
+		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi_tk.phase_end)
+	}
 }
 
 fn main() {
