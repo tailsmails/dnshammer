@@ -573,17 +573,17 @@ fn send_mode(base string, msg string) {
 
 	// Pre-transmission check
 	pi_check := get_phase_info()
-	// Each chunk will have 2 extra bytes (EEEE) unless it's the last part.
-	// Actually, let's just make the chunk size fixed and append EEEE to EACH chunk's worth of data.
-	// User said: "use 'EEEE' as the terminator for each individual chunk, and 'AAAA' for the final end-of-message signal"
+	// Each chunk will have 1 byte (Index) + g_chunk_size (Payload) + 2 bytes (Terminator)
+	wire_chunk_size := 1 + g_chunk_size + 2
 
-	estimated_bits := (g_chunk_size + 2) * 8
-	estimated_time := i64(estimated_bits) * 350 // Slightly more conservative
+	estimated_bits := wire_chunk_size * 8
+	estimated_time := i64(estimated_bits) * 350
 	if estimated_time > pi_check.t1_len {
-		die('Window too small for chunk size ${g_chunk_size} + 2 (EEEE). T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
+		die('Window too small for chunk size ${g_chunk_size}. T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
 	}
 
 	mut pos := 0
+	mut chunk_idx := u8(0)
 	mut resending := false
 	for pos < data.len {
 		pi := wait_for_phase(0) // Wait for T1
@@ -591,23 +591,25 @@ fn send_mode(base string, msg string) {
 
 		mut end := pos + g_chunk_size
 		if end > data.len { end = data.len }
-		mut chunk := data[pos..end].clone()
 
-		// Append EEEE or AAAA?
-		// "EEEE as the terminator for each individual chunk, and AAAA for the final end-of-message signal"
-		// If it's the last chunk of 'data' (which already contains EOM), we don't need another EEEE?
-		// But let's follow strictly:
+		mut chunk := []u8{}
+		chunk << chunk_idx
+		chunk << data[pos..end]
+		// Padding
+		for chunk.len < 1 + g_chunk_size { chunk << u8(0) }
+
 		if end < data.len {
 			chunk << u8(magic_chunk_end >> 8)
 			chunk << u8(magic_chunk_end & 0xFF)
 		} else {
-			// AAAA is already at the end of data if this is the final part.
+			chunk << u8(magic_eom >> 8)
+			chunk << u8(magic_eom & 0xFF)
 		}
 
 		if resending {
-			println('[tx] Resending chunk [${pos}..${end}] (${chunk.len} bytes on wire)')
+			println('[tx] Resending chunk #${chunk_idx} [${pos}..${end}]')
 		} else {
-			println('[tx] Sending chunk [${pos}..${end}] (${chunk.len} bytes on wire)')
+			println('[tx] Sending chunk #${chunk_idx} [${pos}..${end}]')
 		}
 
 		mut chunk_bits := []u8{}
@@ -649,6 +651,7 @@ fn send_mode(base string, msg string) {
 			}
 			if status == status_success || status == status_ok || status == status_start {
 				pos = end
+				chunk_idx++
 				resending = false
 			} else {
 				println('[tx] Receiver reported error. Will resend.')
@@ -661,7 +664,8 @@ fn send_mode(base string, msg string) {
 	}
 
 	println('[tx] Entering final termination handshake...')
-	for {
+	for attempt in 0 .. 10 { // Limit retry attempts
+		println('[tx] Termination handshake attempt #${attempt+1}...')
 		pi_tk := wait_for_phase(2)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
@@ -694,25 +698,26 @@ fn rec_mode(base string) {
 
 	// Pre-transmission check
 	pi_check := get_phase_info()
-	// Receiver reads g_chunk_size + 2 (EEEE/AAAA)
-	estimated_bits := (g_chunk_size + 2) * 8
-	estimated_time := i64(estimated_bits) * 550 // Slightly more conservative for receiver
+	// Index (1) + Payload (g_chunk_size) + Terminator (2)
+	wire_chunk_size := 1 + g_chunk_size + 2
+	estimated_bits := wire_chunk_size * 8
+	estimated_time := i64(estimated_bits) * 550
 	if estimated_time > pi_check.t2_len {
-		die('Window too small for chunk size ${g_chunk_size} + 2. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
+		die('Window too small for chunk size ${g_chunk_size}. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
 	}
 
 	mut expected_hash := u8(0)
 	mut hash_received := false
 	mut final_data := []u8{}
 	mut finished := false
+	mut last_accepted_idx := -1
 
 	for !finished {
 		pi := wait_for_phase(1) // Wait for T2
 		cts := pi.cycle_start / 1000
 		println('[rx] Cycle start, reading chunk...')
 
-		// Chunk includes data + terminator (EEEE or AAAA)
-		num_bits := (g_chunk_size + 2) * 8
+		num_bits := wire_chunk_size * 8
 
 		mut success := true
 		bits := read_bits(base, "d", 0, num_bits, thr, pi.phase_end, cts) or {
@@ -721,33 +726,45 @@ fn rec_mode(base string) {
 			[]u8{}
 		}
 
-		mut chunk_full := []u8{}
 		if success && bits.len == num_bits {
-			for i in 0 .. (g_chunk_size + 2) {
-				b := u8(bits_to_int(bits[i*8 .. (i+1)*8]))
-				chunk_full << b
+			mut chunk_full := []u8{}
+			for i in 0 .. wire_chunk_size {
+				chunk_full << u8(bits_to_int(bits[i*8 .. (i+1)*8]))
 			}
 
-			// Extract terminator
-			terminator := (u16(chunk_full[chunk_full.len - 2]) << 8) | u16(chunk_full[chunk_full.len - 1])
-			mut chunk_data := chunk_full[..chunk_full.len-2].clone()
+			chunk_idx := int(chunk_full[0])
+			terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
+			payload := chunk_full[1..wire_chunk_size-2].clone()
 
 			if terminator == magic_chunk_end || terminator == magic_eom {
-				println('[rx] Chunk terminator valid: ${terminator:04X}')
-				if terminator == magic_eom {
-					finished = true
-				}
+				println('[rx] Chunk #${chunk_idx} valid (terminator: ${terminator:04X})')
 
-				// Handle hash if first chunk
-				if !hash_received {
-					expected_hash = chunk_data[0]
-					chunk_data = chunk_data[1..].clone()
-					hash_received = true
-					println('[rx] Received message hash: ${expected_hash:02X}')
-				}
+				if chunk_idx > last_accepted_idx {
+					mut chunk_data := payload.clone()
 
-				final_data << chunk_data
-				println('[rx] Chunk accepted: ${chunk_data.hex()}')
+					// Handle hash if first chunk
+					if !hash_received {
+						expected_hash = chunk_data[0]
+						chunk_data = chunk_data[1..].clone()
+						hash_received = true
+						println('[rx] Received message hash: ${expected_hash:02X}')
+					}
+
+					// If it's the last chunk, it might have padding
+					if terminator == magic_eom {
+						finished = true
+						// EOM is AA AA. It's at the end of the original data.
+						// Our 'payload' here is just a fixed size part of 'data' (including EOM).
+						// Wait, the sender appends AA AA to 'data' then chunks it.
+						// The payload might contain the AA AA.
+					}
+
+					final_data << chunk_data
+					last_accepted_idx = chunk_idx
+					println('[rx] Chunk accepted.')
+				} else {
+					println('[rx] Chunk #${chunk_idx} already accepted, skipping.')
+				}
 			} else {
 				println('[rx] Invalid chunk terminator: ${terminator:04X}')
 				success = false
