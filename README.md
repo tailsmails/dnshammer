@@ -10,15 +10,16 @@ No custom server infrastructure is needed. Both parties only need access to the 
 
 ## How it works
 
-1. The message is converted to binary (8 bits per byte).
-2. For each bit position, a subdomain like `<bit_index>.<domain>` is used.
-3. A `0` bit is represented by caching that subdomain (two rapid queries warm the cache).
-4. A `1` bit is left uncached (no query is made).
-5. The receiver queries every subdomain and measures response time:
-   - Fast response = cached = bit `0`
-   - Slow response = uncached = bit `1`
-6. A calibration step using known cached (`c0.`) and uncached (`c1.`) subdomains determines the threshold.
-7. The sender runs a keepalive loop to prevent cache entries from expiring before the receiver reads them.
+DNS Hammer uses a multi-phase synchronization protocol to reliably tunnel data:
+
+1.  **Phased Cycles:** Communication is divided into cycles consisting of three phases:
+    -   **T1 (Sender):** The sender caches bits (0 = cached, 1 = uncached). It performs two passes (Initial + Keep-alive) for maximum reliability.
+    -   **T2 (Receiver):** The receiver measures query response times to reconstruct the message.
+    -   **TK (Sync):** Both parties exchange status signals (READY, START, SUCCESS, ERROR) to manage flow control.
+2.  **Bi-Directional Handshake:** The receiver starts by signaling `READY`. The sender acknowledges with `START` only when it detects the receiver is listening.
+3.  **Chunked Transmission:** Messages are split into configurable chunks. Each chunk is indexed and includes a validation hash to detect and correct transmission errors.
+4.  **Fuzzy Matching:** Magic byte sequences (`EEEE` for chunk end, `AAAA` for message end) use fuzzy logic to remain recognizable even with network timing noise.
+5.  **Automatic Fallback:** The tool automatically uses root-level raw sockets for precise timing if available, gracefully falling back to standard UDP sockets if not.
 
 ---
 
@@ -49,7 +50,7 @@ v -enable-globals -o dnsh dnsh.v
 ## Usage
 
 ```
-dnsh [--dns SERVER] [--workers N] <send|rec> [domain] [msg|bytes]
+dnsh [--dns SERVER] [--workers N] [--window SEC] [--hs-window SEC] [--chunk-size N] <send|rec> [domain] [msg]
 ```
 
 ### Send a message
@@ -58,35 +59,27 @@ dnsh [--dns SERVER] [--workers N] <send|rec> [domain] [msg|bytes]
 ./dnsh send example.com "Hello"
 ```
 
-With a specific DNS server and 8 parallel workers:
+With a specific DNS server and 16 parallel workers:
 
 ```
-./dnsh --dns 8.8.8.8 --workers 8 send example.com "Hello"
+./dnsh --dns 8.8.8.8 --workers 16 send example.com "Hello"
 ```
 
 The sender will:
-- Encode and cache the message
-- Print the number of cached subdomains
-- Enter a keepalive loop that periodically refreshes the cache
-
-Keep the sender running until the receiver has finished reading.
+- Calibrate and wait for the receiver's `READY` signal.
+- Transmit the message in indexed chunks with hash verification.
+- Perform a termination handshake to ensure the receiver has fully captured the data.
 
 ### Receive a message
 
 ```
-./dnsh rec example.com 5
+./dnsh rec example.com
 ```
 
-With a specific DNS server:
-
-```
-./dnsh --dns 8.8.8.8 rec example.com 5
-```
-
-The byte count argument must match the length of the sent message. The receiver will:
-- Calibrate by measuring cached vs uncached response times
-- Read each bit sequentially and reconstruct the bytes
-- Print each byte and the final decoded message
+The receiver will:
+- Calibrate and signal `READY` to the sender.
+- Automatically detect the message length and reconstruction boundary via magic bytes.
+- Verify per-chunk and end-to-end hashes for perfect data integrity.
 
 ---
 
@@ -94,9 +87,11 @@ The byte count argument must match the length of the sent message. The receiver 
 
 | Flag | Description |
 |------|-------------|
-| `--dns SERVER` | Use a specific DNS resolver IP instead of the system default |
-| `--workers N` | Number of parallel threads for sending (default: 4). Only affects send mode. Receive is always sequential to preserve timing accuracy. |
-| `--window TIME` | The time of changing the domain to refresh everything cached (default: 100s). |
+| `--dns SERVER` | Use a specific DNS resolver IP. |
+| `--workers N` | Number of parallel threads for sending (default: 16). |
+| `--window SEC` | Duration of the main data phases (default: 100s). |
+| `--hs-window SEC` | Duration of the fast startup handshake cycles (default: 10s). |
+| `--chunk-size N` | Number of bytes to send per cycle (default: 5). |
 
 ---
 
@@ -105,31 +100,31 @@ The byte count argument must match the length of the sent message. The receiver 
 Terminal 1 (sender):
 
 ```
-$ ./dnsh --dns 8.8.8.8 send x88mes11.com "Hi"
-[*] dns server: 8.8.8.8
-[tx] "Hi" -> 2 bytes / 16 bits
-[tx] sending with 4 workers...
-[tx] cached 9 subdomains
-[tx] keepalive running... (ctrl+c to stop)
-
-  [keepalive #1] 9 entries refreshed
-  [keepalive #2] 9 entries refreshed
+$ ./dnsh --dns 8.8.8.8 send target.com "Hi"
+[*] calibrating...
+[*] calibrated threshold: 74545µs
+[tx] "Hi" -> "hi" (2 chars)
+[tx] Hash: FF
+[tx] Waiting for receiver READY signal (0111)...
+[tx] Receiver is READY. Acknowledging and starting.
+[tx] Sending chunk #0 [0..3]
+[tx] Receiver status: 0100
+[tx] Termination confirmed. Done.
 ```
 
-Terminal 2 (receiver, different network):
+Terminal 2 (receiver):
 
 ```
-$ ./dnsh --dns 8.8.8.8 rec x88mes11.com 2
-[*] dns server: 8.8.8.8
-[rx] reading 2 bytes...
-
-[rx] calibrating...
-[rx] fast:1ms slow:24ms gap:23ms thr:12ms
-
-  byte #0  [1, 23, 1, 24, 1, 25, 1, 25]ms  ->  "H"
-  byte #1  [1, 22, 1, 24, 1, 25, 25, 1]ms  ->  "i"
-
-[rx] "Hi"
+$ ./dnsh --dns 8.8.8.8 rec target.com
+[*] calibrating...
+[*] calibrated threshold: 96832µs
+[rx] Sending READY (0111) and waiting for START (1100)...
+[rx] START detected. Entering reading loop.
+[rx] Cycle start, reading chunk...
+[rx] Chunk #0 valid (terminator: AAAA, hash OK)
+[rx] Final message: "hi"
+[rx] Hash verified successfully.
+[rx] Entering termination handshake...
 ```
 
 ---
@@ -137,10 +132,9 @@ $ ./dnsh --dns 8.8.8.8 rec x88mes11.com 2
 ## Limitations
 
 - Throughput is low (a few bytes per session is practical).
-- DNS cache TTL varies by resolver. The keepalive loop compensates, but long delays between send and receive may cause errors.
+- DNS cache TTL varies by resolver. The phased protocol compensates, but long delays between phases may cause errors.
 - Some resolvers may not cache wildcard subdomains or may apply rate limiting.
-- The receiver must know the exact message length in advance.
-- Reading is sequential by design. Parallel reads break timing measurements.
+- Reading is sequential by design to preserve timing accuracy.
 
 ---
 
