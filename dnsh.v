@@ -581,11 +581,11 @@ fn send_mode(base string, msg string) {
 	println('[tx] chunk size: ${g_chunk_size}')
 
 	pi_check := get_phase_info(window)
-	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2)
-	wire_chunk_size := 1 + 1 + g_chunk_size + 2
+	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2) + StatusWarming (0.5)
+	wire_chunk_size := 1 + 1 + g_chunk_size + 3
 
 	estimated_bits := wire_chunk_size * 8
-	estimated_time := i64(estimated_bits) * 350
+	estimated_time := i64(estimated_bits) * 600 // Increased for status bit warming redundancy
 	if estimated_time > pi_check.t1_len {
 		die('Window too small for chunk size ${g_chunk_size}. T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
 	}
@@ -610,17 +610,22 @@ fn send_mode(base string, msg string) {
 				time.sleep(int(pi_tk.phase_end - get_ts()) + 10)
 
 				for _ in 0 .. 3 {
+					// Cycle start (T1)
+					pi_t1_ack := wait_for_phase(0, g_hs_window)
+					cts_ack := pi_t1_ack.cycle_start / 1000
+
+					// Warm cache for START in T1
+					send_bits(base, "s", 0, int_to_bits(status_start, 4), pi_t1_ack.phase_end, cts_ack)
+
 					// Acknowledge in first half of TK
 					pi_tk_ack := wait_for_phase(2, g_hs_window)
-					cts_tk_ack := pi_tk_ack.cycle_start / 1000
 					tk_mid_ack := pi_tk_ack.cycle_start + pi_tk_ack.t1_len + pi_tk_ack.t2_len + (pi_tk_ack.tk_len / 2)
-
-					send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ack, cts_tk_ack)
+					send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ack, cts_ack)
 
 					// Ensure we are past the acknowledgment segment
 					for get_ts() < tk_mid_ack { time.sleep(100 * time.millisecond) }
 
-					// Wait for cycle end before next ACK
+					// Wait for cycle end before next ACK cycle
 					time.sleep(int(pi_tk_ack.phase_end - get_ts()) + 10)
 				}
 				println('[tx] Handshake complete.')
@@ -690,13 +695,18 @@ fn send_mode(base string, msg string) {
 			println('[!] T1 Segment 2 timeout')
 		}
 
+		// If we haven't received first success yet, keep sending START (1100)
+		tk_sig := if first_success { status_ok } else { status_start }
+
+		// Warm the cache for the status signal we will send in TK
+		tk_sig_bits := int_to_bits(int(tk_sig), 4)
+		send_bits(base, "s", 0, tk_sig_bits, pi.phase_end, cts)
+
 		// TK window
 		pi_tk := wait_for_phase(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
 
-		// If we haven't received first success yet, keep sending START (1100)
-		tk_sig := if first_success { status_ok } else { status_start }
 		send_bits(base, "s", 0, int_to_bits(tk_sig, 4), tk_mid, cts_tk)
 
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
