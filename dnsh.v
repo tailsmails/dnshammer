@@ -604,18 +604,24 @@ fn send_mode(base string, msg string) {
 			if status == status_ready {
 				println('[tx] Receiver is READY. Acknowledging and starting.')
 
-				println('[tx] Sending START acknowledgement...')
+				println('[tx] Sending START acknowledgement (3 cycles)...')
 				// Wait for current TK to end
 				time.sleep(int(pi_tk.phase_end - get_ts()) + 10)
 
-				// Acknowledge in first half of NEXT TK
-				pi_tk_next := wait_for_phase(2, g_hs_window)
-				cts_tk_next := pi_tk_next.cycle_start / 1000
-				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
-				send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_next, cts_tk_next)
+				for _ in 0 .. 3 {
+					// Acknowledge in first half of TK
+					pi_tk_ack := wait_for_phase(2, g_hs_window)
+					cts_tk_ack := pi_tk_ack.cycle_start / 1000
+					tk_mid_ack := pi_tk_ack.cycle_start + pi_tk_ack.t1_len + pi_tk_ack.t2_len + (pi_tk_ack.tk_len / 2)
 
-				// Ensure we are past the acknowledgment window
-				for get_ts() < tk_mid_next { time.sleep(100 * time.millisecond) }
+					send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ack, cts_tk_ack)
+
+					// Ensure we are past the acknowledgment segment
+					for get_ts() < tk_mid_ack { time.sleep(100 * time.millisecond) }
+
+					// Wait for cycle end before next ACK
+					time.sleep(int(pi_tk_ack.phase_end - get_ts()) + 10)
+				}
 				println('[tx] Handshake complete.')
 				break
 			}
@@ -703,6 +709,15 @@ fn send_mode(base string, msg string) {
 
 		if got_status {
 			println('[tx] Receiver status: ${status:04b}')
+			if status == status_ready {
+				println('[tx] Receiver appears to be in handshake mode. Re-acknowledging...')
+				pi_tk_ra := wait_for_phase(2, window)
+				cts_tk_ra := pi_tk_ra.cycle_start / 1000
+				tk_mid_ra := pi_tk_ra.cycle_start + pi_tk_ra.t1_len + pi_tk_ra.t2_len + (pi_tk_ra.tk_len / 2)
+				send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ra, cts_tk_ra)
+				resending = true
+				continue
+			}
 			if status == status_stop {
 				println('[tx] Receiver requested stop. Confirming.')
 				break
@@ -752,7 +767,7 @@ fn rec_mode(base string) {
 	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2)
 	wire_chunk_size := 1 + 1 + g_chunk_size + 2
 	estimated_bits := wire_chunk_size * 8
-	estimated_time := i64(estimated_bits) * 550
+	estimated_time := i64(estimated_bits) * 550 // Matches receiver's conservative estimate
 	if estimated_time > pi_check.t2_len {
 		die('Window too small for chunk size ${g_chunk_size} + 3. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
 	}
