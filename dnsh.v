@@ -55,6 +55,7 @@ const magic_chunk_end = u16(0xEEEE)
 
 const status_success = 0b0110
 const status_success_n = 0b0100
+const status_success_alt = 0b0101
 const status_error = 0b1001
 const status_ok = 0b1010
 const status_start = 0b1100
@@ -632,6 +633,7 @@ fn send_mode(base string, msg string) {
 	mut pos := 0
 	mut chunk_idx := u8(0)
 	mut resending := false
+	mut first_success := false
 	for pos < data.len {
 		pi := wait_for_phase(0, window) // Wait for T1
 		cts := pi.cycle_start / 1000
@@ -692,7 +694,10 @@ fn send_mode(base string, msg string) {
 		pi_tk := wait_for_phase(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-		send_bits(base, "s", 0, int_to_bits(status_ok, 4), tk_mid, cts_tk)
+
+		// If we haven't received first success yet, keep sending START (1100)
+		tk_sig := if first_success { status_ok } else { status_start }
+		send_bits(base, "s", 0, int_to_bits(tk_sig, 4), tk_mid, cts_tk)
 
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 
@@ -722,10 +727,11 @@ fn send_mode(base string, msg string) {
 				println('[tx] Receiver requested stop. Confirming.')
 				break
 			}
-			if status == status_success || status == status_ok || status == status_start || status == status_success_n {
+			if status == status_success || status == status_ok || status == status_start || status == status_success_n || status == status_success_alt {
 				pos = end
 				chunk_idx++
 				resending = false
+				first_success = true
 			} else {
 				println('[tx] Receiver reported error. Will resend.')
 				resending = true
@@ -900,7 +906,8 @@ fn rec_mode(base string) {
 		tk_status := if !hash_received {
 			status_ready
 		} else if success {
-			status_start
+			// Randomly use success or alt success to provide variety as requested
+			if rand.intn(2) or { 0 } == 0 { status_success_n } else { status_success_alt }
 		} else {
 			status_error
 		}
