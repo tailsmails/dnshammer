@@ -34,15 +34,6 @@ mut:
 	s_addr u32
 }
 
-struct ICMPHeader {
-mut:
-	@type    u8
-	code     u8
-	checksum u16
-	id       u16
-	seq      u16
-}
-
 struct SockTimeout {
 mut:
 	sec  i64
@@ -50,7 +41,6 @@ mut:
 }
 
 __global g_dns = ''
-__global g_target = ''
 __global g_workers = 16
 __global window = 100
 __global g_hs_window = 10
@@ -125,14 +115,13 @@ fn get_phase_info(w int) PhaseInfo {
 fn wait_for_phase_start(target_phase int, w int) PhaseInfo {
 	for {
 		pi := get_phase_info(w)
-		// If we are already in the target phase, check if we are at the very beginning
 		if pi.phase == target_phase {
 			now := get_ts()
 			mut phase_start := pi.cycle_start
 			if pi.phase == 1 { phase_start += pi.t1_len }
 			if pi.phase == 2 { phase_start += pi.t1_len + pi.t2_len }
 
-			if now - phase_start < 200 { // within first 200ms
+			if now - phase_start < 200 {
 				return pi
 			}
 
@@ -142,13 +131,11 @@ fn wait_for_phase_start(target_phase int, w int) PhaseInfo {
 			continue
 		}
 
-		// If we are not in the target phase, wait for the current phase to end.
 		sleep_ms := int(pi.phase_end - get_ts()) + 10
 		if sleep_ms > 0 {
 			time.sleep(sleep_ms * time.millisecond)
 		}
 
-		// Re-check after sleeping
 		new_pi := get_phase_info(w)
 		if new_pi.phase == target_phase {
 			return new_pi
@@ -158,24 +145,31 @@ fn wait_for_phase_start(target_phase int, w int) PhaseInfo {
 }
 
 fn char_idx(ch u8) int {
-	if ch == ` ` { return 0 }
-	return int(ch - `a`) + 1
+	alphabet := " abcdefghijklmnopqrstuvwxyz0123456789."
+	for i := 0; i < alphabet.len; i++ {
+		if alphabet[i] == ch { return i }
+	}
+	return -1
 }
 
 fn huffman_encode(msg string) ([]u8, string) {
-	codes :=[u32(0), 5, 60, 25, 22, 1, 56, 57, 21, 7, 125, 124, 23, 26, 8, 6, 59, 254, 20, 9, 4, 24, 61, 27, 126, 58, 255]
-	lens :=[u8(3), 4, 6, 5, 5, 3, 6, 6, 5, 4, 7, 7, 5, 5, 4, 4, 6, 8, 5, 4, 4, 5, 6, 5, 7, 6, 8]
+	codes := [u32(0), 2, 52, 22, 23, 3, 53, 54, 4, 5, 252, 119, 24, 55, 6, 7, 56, 253, 8, 9, 10, 25, 120, 57, 254, 58, 255, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 118]
+	lens := [u8(3), 4, 6, 5, 5, 4, 6, 6, 4, 4, 8, 7, 5, 6, 4, 4, 6, 8, 4, 4, 4, 5, 7, 6, 8, 6, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 7]
 
-	mut filtered :=[]u8{}
+	mut filtered := []u8{}
+	alphabet := " abcdefghijklmnopqrstuvwxyz0123456789."
 	for ch in msg.bytes() {
 		mut c := ch
 		if c >= `A` && c <= `Z` { c += 32 }
-		if (c >= `a` && c <= `z`) || c == ` ` { filtered << c }
+		if alphabet.contains(c.ascii_str()) {
+			filtered << c
+		}
 	}
 
-	mut bits :=[]u8{}
+	mut bits := []u8{}
 	for c in filtered {
 		idx := char_idx(c)
+		if idx < 0 { continue }
 		code := codes[idx]
 		length := int(lens[idx])
 		for b in 0 .. length {
@@ -183,7 +177,7 @@ fn huffman_encode(msg string) ([]u8, string) {
 		}
 	}
 
-	mut result :=[]u8{}
+	mut result := []u8{}
 	result << u8(filtered.len)
 	mut i := 0
 	for i < bits.len {
@@ -198,22 +192,22 @@ fn huffman_encode(msg string) ([]u8, string) {
 	return result, filtered.bytestr()
 }
 
-fn huffman_decode(data[]u8) string {
+fn huffman_decode(data []u8) string {
 	if data.len < 2 { return '' }
 	nchars := int(data[0])
-	syms :=[u8(` `), `e`, `t`, `a`, `o`, `i`, `n`, `s`, `r`, `h`, `d`, `l`, `u`, `c`, `m`, `w`, `f`, `g`, `y`, `p`, `b`, `v`, `k`, `j`, `x`, `q`, `z`]
-	fc :=[0, 0, 0, 0, 4, 20, 56, 124, 254]
-	fo :=[0, 0, 0, 0, 2, 8, 16, 22, 25]
-	cn :=[0, 0, 0, 2, 6, 8, 6, 3, 2]
+	syms := [u8(` `), u8(`a`), u8(`e`), u8(`h`), u8(`i`), u8(`n`), u8(`o`), u8(`r`), u8(`s`), u8(`t`), u8(`c`), u8(`d`), u8(`l`), u8(`u`), u8(`b`), u8(`f`), u8(`g`), u8(`m`), u8(`p`), u8(`w`), u8(`y`), u8(`.`), u8(`k`), u8(`v`), u8(`0`), u8(`1`), u8(`2`), u8(`3`), u8(`4`), u8(`5`), u8(`6`), u8(`7`), u8(`8`), u8(`9`), u8(`j`), u8(`q`), u8(`x`), u8(`z`)]
+	fc := [0, 0, 0, 0, 2, 22, 52, 118, 242]
+	fo := [0, 0, 0, 0, 1, 10, 14, 21, 24]
+	cn := [0, 0, 0, 1, 9, 4, 7, 3, 14]
 
-	mut bits :=[]u8{}
+	mut bits := []u8{}
 	for i in 1 .. data.len {
 		for b in 0 .. 8 {
 			bits << (data[i] >> u8(7 - b)) & 1
 		}
 	}
 
-	mut result :=[]u8{}
+	mut result := []u8{}
 	mut pos := 0
 	for _ in 0 .. nchars {
 		mut code := u32(0)
@@ -231,94 +225,6 @@ fn huffman_decode(data[]u8) string {
 		if !found { break }
 	}
 	return result.bytestr()
-}
-
-fn icmp_checksum(data []u8) u16 {
-	mut sum := u32(0)
-	for i := 0; i < data.len; i += 2 {
-		if i + 1 < data.len {
-			sum += u32(data[i]) << 8 | u32(data[i+1])
-		} else {
-			sum += u32(data[i]) << 8
-		}
-	}
-	for (sum >> 16) != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return u16(~sum & 0xFFFF)
-}
-
-fn build_icmp_packet(id u16, seq u16) []u8 {
-	mut hdr := ICMPHeader{
-		@type: 8 // Echo Request
-		code: 0
-		checksum: 0
-		id: id
-		seq: seq
-	}
-	mut pkt := []u8{len: 8}
-	pkt[0] = hdr.@type
-	pkt[1] = hdr.code
-	pkt[2] = 0 // checksum high
-	pkt[3] = 0 // checksum low
-	pkt[4] = u8(hdr.id >> 8)
-	pkt[5] = u8(hdr.id & 0xFF)
-	pkt[6] = u8(hdr.seq >> 8)
-	pkt[7] = u8(hdr.seq & 0xFF)
-
-	ck := icmp_checksum(pkt)
-	pkt[2] = u8(ck >> 8)
-	pkt[3] = u8(ck & 0xFF)
-	return pkt
-}
-
-fn send_icmp_flood(target string, deadline i64) {
-	fd := C.socket(C.AF_INET, C.SOCK_RAW, 1) // IPPROTO_ICMP
-	if fd < 0 { return }
-
-	mut sa := C.sockaddr_in{}
-	sa.sin_family = u16(C.AF_INET)
-	C.inet_pton(C.AF_INET, target.str, &sa.sin_addr)
-
-	mut seq := u16(0)
-	id := u16(rand.intn(65535) or { 0 })
-
-	for get_ts() < deadline {
-		pkt := build_icmp_packet(id, seq)
-		C.sendto(fd, pkt.data, pkt.len, 0, &sa, sizeof(sa))
-		seq++
-		// Flood mode: minimal delay
-	}
-	C.close(fd)
-}
-
-fn measure_icmp_rtt(target string) i64 {
-	fd := C.socket(C.AF_INET, C.SOCK_RAW, 1)
-	if fd < 0 { return -1 }
-
-	tv := SockTimeout{sec: 1, usec: 0}
-	C.setsockopt(fd, C.SOL_SOCKET, C.SO_RCVTIMEO, &tv, sizeof(tv))
-
-	mut sa := C.sockaddr_in{}
-	sa.sin_family = u16(C.AF_INET)
-	C.inet_pton(C.AF_INET, target.str, &sa.sin_addr)
-
-	id := u16(rand.intn(65535) or { 0 })
-	pkt := build_icmp_packet(id, 1)
-
-	sw := time.new_stopwatch()
-	if C.sendto(fd, pkt.data, pkt.len, 0, &sa, sizeof(sa)) < 0 {
-		C.close(fd)
-		return -1
-	}
-
-	mut buf := []u8{len: 512}
-	n := C.recv(fd, buf.data, 512, 0)
-	elapsed := sw.elapsed().microseconds()
-	C.close(fd)
-
-	if n < 0 { return -1 }
-	return elapsed
 }
 
 fn build_dns_query(host string, tx_id u16)[]u8 {
@@ -620,52 +526,6 @@ fn send_bits(base string, prefix string, start_idx int, bits []u8, deadline i64,
 	return get_ts() <= deadline
 }
 
-fn send_bits_icmp(target string, bits []u8, deadline i64) bool {
-	// Calculate bit duration based on remaining time
-	remaining := deadline - get_ts()
-	if remaining <= 0 { return false }
-	bit_duration := remaining / i64(bits.len)
-
-	for b in bits {
-		bit_deadline := get_ts() + bit_duration
-		if b == 1 {
-			// Pressure
-			send_icmp_flood(target, bit_deadline)
-		} else {
-			// No pressure
-			for get_ts() < bit_deadline { time.sleep(10 * time.millisecond) }
-		}
-	}
-	return true
-}
-
-fn read_bits_icmp(target string, num_bits int, thr i64, deadline i64) ![]u8 {
-	mut res := []u8{}
-	remaining := deadline - get_ts()
-	if remaining <= 0 { return error('no time left') }
-	bit_duration := remaining / i64(num_bits)
-
-	for _ in 0 .. num_bits {
-		bit_deadline := get_ts() + bit_duration
-		mut samples := []i64{}
-		for get_ts() < bit_deadline - 50 {
-			rtt := measure_icmp_rtt(target)
-			if rtt > 0 { samples << rtt }
-			time.sleep(50 * time.millisecond)
-		}
-		if samples.len == 0 {
-			res << u8(0) // Default
-		} else {
-			samples.sort()
-			med := samples[samples.len / 2]
-			res << (if med > thr { u8(1) } else { u8(0) })
-		}
-		// Wait for bit end
-		for get_ts() < bit_deadline { time.sleep(10 * time.millisecond) }
-	}
-	return res
-}
-
 fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, deadline i64, cts i64) ![]u8 {
 	mut res := []u8{}
 	for i in 0 .. num_bits {
@@ -694,45 +554,6 @@ fn simple_hash(data []u8) u8 {
 	return u8(h & 0xFF)
 }
 
-
-fn calibrate_icmp(target string) !i64 {
-	println('[*] calibrating ICMP (waiting for sender pattern)...')
-	mut slow_arr := []i64{}
-	mut fast_arr := []i64{}
-
-	// User said: sender sends 1-window (pressure) then 0-window (no pressure)
-	// Receiver needs to sync with these two windows.
-
-	// Wait for T1 of a cycle
-	pi := wait_for_phase_start(0, window)
-	println('[*] Measuring pressure window...')
-	for get_ts() < pi.phase_end {
-		rtt := measure_icmp_rtt(target)
-		if rtt > 0 { slow_arr << rtt }
-		time.sleep(100 * time.millisecond)
-	}
-
-	// Wait for T1 of NEXT cycle (we assume sender follows this pattern for calibration)
-	pi_next := wait_for_phase_start(0, window)
-	println('[*] Measuring silent window...')
-	for get_ts() < pi_next.phase_end {
-		rtt := measure_icmp_rtt(target)
-		if rtt > 0 { fast_arr << rtt }
-		time.sleep(100 * time.millisecond)
-	}
-
-	if slow_arr.len < 3 || fast_arr.len < 3 { return error('ICMP calibration failed') }
-
-	slow_arr.sort()
-	fast_arr.sort()
-	slow_med := slow_arr[slow_arr.len / 2]
-	fast_med := fast_arr[fast_arr.len / 2]
-
-	gap := slow_med - fast_med
-	mut thr := fast_med + (gap / 2)
-	println('[*] ICMP med_slow:${slow_med}µs med_fast:${fast_med}µs thr:${thr}µs')
-	return thr
-}
 
 fn calibrate(base string) !i64 {
 	println('[*] calibrating...')
@@ -788,142 +609,6 @@ fn int_to_bits(val int, num_bits int) []u8 {
 	return res
 }
 
-fn send_mode_icmp(target string, msg string) {
-	// Startup: Calibrate as sender
-	println('[tx] ICMP Startup Pattern...')
-	for _ in 0 .. 2 {
-		// Window 1: Pressure
-		pi_p := wait_for_phase_start(0, window)
-		send_bits_icmp(target, [u8(1), 1, 1, 1], pi_p.phase_end)
-		// Window 2: Silence
-		pi_s := wait_for_phase_start(0, window)
-		send_bits_icmp(target, [u8(0), 0, 0, 0], pi_s.phase_end)
-	}
-
-	// Pre-transmission RTT check (minimal threshold establishment)
-	mut base_rtt := measure_icmp_rtt(target)
-	if base_rtt < 0 { die('target not reachable') }
-	thr := base_rtt + 50000 // 5ms buffer
-	println('[tx] Established base threshold: ${thr}µs')
-
-	// Handshake
-	println('[tx] Waiting for READY (0111)...')
-	for {
-		pi := wait_for_phase_start(2, window)
-		tk_mid := pi.cycle_start + pi.t1_len + pi.t2_len + (pi.tk_len / 2)
-		for get_ts() < tk_mid { time.sleep(10 * time.millisecond) }
-
-		bits := read_bits_icmp(target, 4, thr, pi.phase_end) or { continue }
-		if bits_to_int(bits) == status_ready {
-			println('[tx] READY detected. Sending START acknowledgment...')
-			pi_ack := wait_for_phase_start(2, window)
-			send_bits_icmp(target, int_to_bits(status_start, 4), pi_ack.cycle_start + pi_ack.t1_len + pi_ack.t2_len + (pi_ack.tk_len / 2))
-			break
-		}
-	}
-
-	// Data loop - Re-using DNA logic but with ICMP bit senders
-	mut raw_data, _ := huffman_encode(msg)
-	mut data := []u8{}
-	data << raw_data
-	data << u8(magic_eom >> 8)
-	data << u8(magic_eom & 0xFF)
-
-	mut pos := 0
-	mut chunk_idx := u8(0)
-	for pos < data.len {
-		pi := wait_for_phase_start(0, window)
-
-		mut end := pos + g_chunk_size
-		if end > data.len { end = data.len }
-		mut payload := data[pos..end].clone()
-		for payload.len < g_chunk_size { payload << u8(0) }
-
-		mut chunk := []u8{}
-		chunk << chunk_idx
-		chunk << payload
-		terminator := if end < data.len { magic_chunk_end } else { magic_eom }
-		chunk << u8(terminator >> 8)
-		chunk << u8(terminator & 0xFF)
-
-		mut chunk_bits := []u8{}
-		for b in chunk { chunk_bits << int_to_bits(int(b), 8) }
-
-		println('[tx] Sending chunk #${chunk_idx} via ICMP...')
-		send_bits_icmp(target, chunk_bits, pi.phase_end)
-
-		// Status check in TK
-		pi_tk := wait_for_phase_start(2, window)
-		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
-
-		status_bits := read_bits_icmp(target, 4, thr, pi_tk.phase_end) or { []u8{} }
-		if status_bits.len == 4 {
-			status := bits_to_int(status_bits)
-			if status == status_success || status == status_ok || status == status_success_n || status == status_success_alt {
-				pos = end
-				chunk_idx++
-			}
-		}
-	}
-	println('[tx] ICMP transmission complete.')
-}
-
-fn rec_mode_icmp(target string) {
-	thr := calibrate_icmp(target) or { die('ICMP calibration failed') }
-
-	println('[rx] Sending READY (0111) and waiting for START (1100)...')
-	for {
-		pi := wait_for_phase_start(2, window)
-		tk_mid := pi.cycle_start + pi.t1_len + pi.t2_len + (pi.tk_len / 2)
-		send_bits_icmp(target, int_to_bits(status_ready, 4), pi.phase_end)
-
-		pi_tk := wait_for_phase_start(2, window)
-		conf_bits := read_bits_icmp(target, 4, thr, pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)) or { []u8{} }
-		if bits_to_int(conf_bits) == status_start {
-			println('[rx] START detected.')
-			break
-		}
-	}
-
-	mut final_data := []u8{}
-	mut finished := false
-	mut last_idx := -1
-	wire_size := 1 + g_chunk_size + 2
-
-	for !finished {
-		pi := wait_for_phase_start(1, window)
-		println('[rx] Reading ICMP chunk...')
-
-		bits := read_bits_icmp(target, wire_size * 8, thr, pi.phase_end) or { []u8{} }
-		if bits.len == wire_size * 8 {
-			mut chunk := []u8{}
-			for i in 0 .. wire_size { chunk << u8(bits_to_int(bits[i*8..(i+1)*8])) }
-
-			idx := int(chunk[0])
-			payload := chunk[1..wire_size-2].clone()
-			terminator := (u16(chunk[wire_size-2]) << 8) | u16(chunk[wire_size-1])
-
-			if is_fuzzy_match(terminator, magic_chunk_end) || is_fuzzy_match(terminator, magic_eom) {
-				if idx > last_idx {
-					final_data << payload
-					last_idx = idx
-				}
-				if is_fuzzy_match(terminator, magic_eom) { finished = true }
-
-				// ACK
-				pi_tk := wait_for_phase_start(2, window)
-				tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-				for get_ts() < tk_mid { time.sleep(10 * time.millisecond) }
-				send_bits_icmp(target, int_to_bits(status_success, 4), pi_tk.phase_end)
-			}
-		}
-	}
-
-	decoded := huffman_decode(final_data)
-	println('[rx] ICMP Final message: "${decoded}"')
-}
-
 fn send_mode(base string, msg string) {
 	thr := calibrate(base) or { die('calibration failed') }
 
@@ -951,12 +636,9 @@ fn send_mode(base string, msg string) {
 
 	println('[tx] Waiting for receiver READY signal (0111)...')
 	for {
-		// Sender waits for TK to read receiver status
 		pi_tk := wait_for_phase_start(2, g_hs_window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-
-		// Read READY from receiver in second half of TK
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 		status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { []u8{} }
 		if status_bits.len == 4 {
@@ -965,26 +647,16 @@ fn send_mode(base string, msg string) {
 				println('[tx] Receiver is READY. Acknowledging and starting.')
 
 				println('[tx] Sending START acknowledgement (3 cycles)...')
-				// Wait for current TK to end
 				time.sleep(int(pi_tk.phase_end - get_ts()) + 10)
 
 				for _ in 0 .. 3 {
-					// Cycle start (T1)
 					pi_t1_ack := wait_for_phase_start(0, g_hs_window)
 					cts_ack := pi_t1_ack.cycle_start / 1000
-
-					// Warm cache for START in T1
 					send_bits(base, "s", 0, int_to_bits(status_start, 4), pi_t1_ack.phase_end, cts_ack)
-
-					// Acknowledge in first half of TK
 					pi_tk_ack := wait_for_phase_start(2, g_hs_window)
 					tk_mid_ack := pi_tk_ack.cycle_start + pi_tk_ack.t1_len + pi_tk_ack.t2_len + (pi_tk_ack.tk_len / 2)
 					send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ack, cts_ack)
-
-					// Ensure we are past the acknowledgment segment
 					for get_ts() < tk_mid_ack { time.sleep(100 * time.millisecond) }
-
-					// Wait for cycle end before next ACK cycle
 					time.sleep(int(pi_tk_ack.phase_end - get_ts()) + 10)
 				}
 				println('[tx] Handshake complete.')
@@ -1006,7 +678,6 @@ fn send_mode(base string, msg string) {
 		if end > data.len { end = data.len }
 
 		mut payload := data[pos..end].clone()
-		// Padding payload to g_chunk_size
 		for payload.len < g_chunk_size { payload << u8(0) }
 
 		mut chunk_pre := []u8{}
@@ -1038,30 +709,17 @@ fn send_mode(base string, msg string) {
 			chunk_bits << int_to_bits(int(b), 8)
 		}
 
-		// Divide T1 into two segments: initial and keep-alive
 		t1_mid := pi.cycle_start + (pi.t1_len / 2)
-
-		// Segment 1: Initial transmission
 		if !send_bits(base, "d", 0, chunk_bits, t1_mid, cts) {
 			println('[!] T1 Segment 1 timeout')
 		}
-
-		// Wait for segment 2 start
 		for get_ts() < t1_mid { time.sleep(10 * time.millisecond) }
-
-		// Segment 2: Keep-alive (second pass)
 		if !send_bits(base, "d", 0, chunk_bits, pi.phase_end, cts) {
 			println('[!] T1 Segment 2 timeout')
 		}
-
-		// If we haven't received first success yet, keep sending START (1100)
 		tk_sig := if first_success { status_ok } else { status_start }
-
-		// Warm the cache for the status signal we will send in TK
 		tk_sig_bits := int_to_bits(int(tk_sig), 4)
 		send_bits(base, "s", 0, tk_sig_bits, pi.phase_end, cts)
-
-		// TK window
 		pi_tk := wait_for_phase_start(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
@@ -1147,7 +805,7 @@ fn rec_mode(base string) {
 	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2)
 	wire_chunk_size := 1 + 1 + g_chunk_size + 2
 	estimated_bits := wire_chunk_size * 8
-	estimated_time := i64(estimated_bits) * 550 // Matches receiver's conservative estimate
+	estimated_time := i64(estimated_bits) * 550
 	if estimated_time > pi_check.t2_len {
 		die('Window too small for chunk size ${g_chunk_size} + 3. T2=${pi_check.t2_len}ms, need ~${estimated_time}ms')
 	}
@@ -1162,15 +820,11 @@ fn rec_mode(base string) {
 	for {
 		pi := wait_for_phase_start(1, g_hs_window) // Cycle start
 		cts := pi.cycle_start / 1000
-
-		// 1. Send READY in final third of T2
 		t2_start := pi.cycle_start + pi.t1_len
 		t2_third := pi.t2_len / 3
 		ready_time := t2_start + 2 * t2_third
 		for get_ts() < ready_time { time.sleep(100 * time.millisecond) }
 		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi.phase_end, cts)
-
-		// 2. Read START from sender in first half of TK
 		pi_tk := wait_for_phase_start(2, g_hs_window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
@@ -1183,8 +837,6 @@ fn rec_mode(base string) {
 				break
 			}
 		}
-
-		// 3. Send READY in second half of TK
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi_tk.phase_end, cts)
 	}
@@ -1213,13 +865,10 @@ fn rec_mode(base string) {
 			chunk_hash := chunk_full[1]
 			payload := chunk_full[2..wire_chunk_size-2].clone()
 			terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
-
-			// Verify terminator with fuzzy matching
 			is_eom := is_fuzzy_match(terminator, magic_eom)
 			is_chunk_end := is_fuzzy_match(terminator, magic_chunk_end)
 
 			if is_chunk_end || is_eom {
-				// Verify chunk hash
 				mut chunk_pre := []u8{}
 				chunk_pre << chunk_idx
 				chunk_pre << payload
@@ -1230,8 +879,6 @@ fn rec_mode(base string) {
 
 					if int(chunk_idx) > last_accepted_idx {
 						mut chunk_data := payload.clone()
-
-						// Handle hash if first chunk
 						if !hash_received {
 							expected_hash = chunk_data[0]
 							chunk_data = chunk_data[1..].clone()
@@ -1280,7 +927,6 @@ fn rec_mode(base string) {
 		tk_status := if !hash_received {
 			status_ready
 		} else if success {
-			// Randomly use success or alt success to provide variety as requested
 			if rand.intn(2) or { 0 } == 0 { status_success_n } else { status_success_alt }
 		} else {
 			status_error
@@ -1294,8 +940,6 @@ fn rec_mode(base string) {
 
 	decoded := huffman_decode(final_data)
 	println('\n[rx] Final message: "${decoded}"')
-
-	// Verify final hash
 	actual_hash := simple_hash(decoded.bytes())
 	if actual_hash != expected_hash {
 		println('[!] Hash mismatch! Expected: ${expected_hash:02X}, Actual: ${actual_hash:02X}')
@@ -1360,9 +1004,6 @@ fn main() {
 			g_tk_len = os.args[i + 1].int()
 			if g_tk_len < 1 { g_tk_len = 1 }
 			i += 2
-		} else if os.args[i] == '--target' && i + 1 < os.args.len {
-			g_target = os.args[i + 1]
-			i += 2
 		} else {
 			args << os.args[i]
 			i += 1
@@ -1372,9 +1013,9 @@ fn main() {
 	if g_dns.len > 0 { println('[*] dns server: ${g_dns}') }
 
 	if args.len < 1 {
-		eprintln('dnsh [--dns SERVER] [--target IP] [--workers N] [--window SEC] [--chunk-size N] [--tk-len N] <send|rec|send_1|rec_1> [domain/target] [msg]')
+		eprintln('dnsh [--dns SERVER] [--workers N] [--window SEC] [--chunk-size N] [--tk-len N] <send|rec> [domain] [msg]')
 		eprintln('  sudo ./dnsh --dns 8.8.8.8 send x.com "hello world"')
-		eprintln('  sudo ./dnsh --target 127.0.0.1 send_1 dummy "hello world"')
+		eprintln('  sudo ./dnsh --dns 8.8.8.8 rec  x.com')
 		exit(1)
 	}
 	match args[0] {
@@ -1387,15 +1028,6 @@ fn main() {
 			d := if args.len > 1 { args[1] } else { 'x.com' }
 			rec_mode(d)
 		}
-		'send_1' {
-			t := if args.len > 1 { args[1] } else { '127.0.0.1' }
-			m := if args.len > 2 { args[2] } else { 'hi' }
-			send_mode_icmp(t, m)
-		}
-		'rec_1' {
-			t := if args.len > 1 { args[1] } else { '127.0.0.1' }
-			rec_mode_icmp(t)
-		}
-		else { die('use send, rec, send_1 or rec_1') }
+		else { die('send or rec') }
 	}
 }
