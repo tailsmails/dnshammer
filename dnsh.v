@@ -49,8 +49,6 @@ __global g_tk_len = 6
 __global g_no_hash_check = false
 __global g_fallback_notified = false
 
-const magic_eof = u16(0xFFFF)
-const magic_no_signal = u16(0x0000)
 const magic_eom = u16(0xAAAA)
 const magic_chunk_end = u16(0xEEEE)
 
@@ -62,7 +60,6 @@ const status_ok = 0b1010
 const status_start = 0b1100
 const status_ready = 0b0111
 const status_stop = 0b0001
-const status_confirm_stop = 0b1000
 
 fn get_ts() i64 {
 	return time.now().unix_milli()
@@ -497,9 +494,9 @@ fn die(s string) {
 
 fn send_bit_task(base string, prefix string, idx int, cts i64) {
 	for _ in 0 .. 5 {
-		resolve('${prefix}${idx}${cts}.${base}', false) or { return }
-		resolve('v${prefix}${idx}${cts}.${base}', false) or { return }
-		resolve('w${prefix}${idx}${cts}.${base}', false) or { return }
+		_ = resolve('${prefix}${idx}${cts}.${base}', false) or { return }
+		_ = resolve('v${prefix}${idx}${cts}.${base}', false) or { return }
+		_ = resolve('w${prefix}${idx}${cts}.${base}', false) or { return }
 	}
 }
 
@@ -619,18 +616,17 @@ fn send_mode(base string, msg string) {
 	data << raw_data
 
 	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
-	println('[tx] ${data.len} total wire bytes (incl. Hash)')
+	println('[tx] ${data.len} total wire bytes')
 	println('[tx] chunk size: ${g_chunk_size}')
 	
 	pi_check := get_phase_info(window)
-	// Index (1) + ChunkHash (1 or 0) + Payload (g_chunk_size) + Terminator (2) + StatusWarming (1)
 	mut wire_chunk_size := 1 + 1 + g_chunk_size + 3
 	if g_no_hash_check {
 		wire_chunk_size = 1 + g_chunk_size + 3
 	}
 	
 	estimated_bits := wire_chunk_size * 8
-	estimated_time := i64(estimated_bits) * 600 // Increased for status bit warming redundancy
+	estimated_time := i64(estimated_bits) * 600
 	if estimated_time > pi_check.t1_len {
 		die('Window too small for chunk size ${g_chunk_size}. T1=${pi_check.t1_len}ms, need ~${estimated_time}ms')
 	}
@@ -646,7 +642,6 @@ fn send_mode(base string, msg string) {
 			status := bits_to_int(status_bits)
 			if status == status_ready {
 				println('[tx] Receiver is READY. Acknowledging and starting.')
-				
 				println('[tx] Sending START acknowledgement (3 cycles)...')
 				time.sleep(int(pi_tk.phase_end - get_ts()) + 10)
 
@@ -672,7 +667,7 @@ fn send_mode(base string, msg string) {
 	mut resending := false
 	mut first_success := false
 	for pos < data.len {
-		pi := wait_for_phase_start(0, window) // Wait for T1
+		pi := wait_for_phase_start(0, window)
 		cts := pi.cycle_start / 1000
 		
 		mut end := pos + g_chunk_size
@@ -683,7 +678,6 @@ fn send_mode(base string, msg string) {
 
 		mut chunk := []u8{}
 		chunk << chunk_idx
-
 		if !g_no_hash_check {
 			mut chunk_pre := []u8{}
 			chunk_pre << chunk_idx
@@ -691,7 +685,6 @@ fn send_mode(base string, msg string) {
 			ch_hash := simple_hash(chunk_pre)
 			chunk << ch_hash
 		}
-
 		chunk << payload
 		
 		if end < data.len {
@@ -714,77 +707,65 @@ fn send_mode(base string, msg string) {
 		}
 		
 		t1_mid := pi.cycle_start + (pi.t1_len / 2)
-		if !send_bits(base, "d", 0, chunk_bits, t1_mid, cts) {
-			println('[!] T1 Segment 1 timeout')
-		}
+		_ = send_bits(base, "d", 0, chunk_bits, t1_mid, cts)
 		for get_ts() < t1_mid { time.sleep(10 * time.millisecond) }
-		if !send_bits(base, "d", 0, chunk_bits, pi.phase_end, cts) {
-			println('[!] T1 Segment 2 timeout')
-		}
+		_ = send_bits(base, "d", 0, chunk_bits, pi.phase_end, cts)
+
 		tk_sig := if first_success { status_ok } else { status_start }
 		tk_sig_bits := int_to_bits(int(tk_sig), 4)
-		send_bits(base, "s", 0, tk_sig_bits, pi.phase_end, cts)
+		_ = send_bits(base, "s", 0, tk_sig_bits, pi.phase_end, cts)
+
 		pi_tk := wait_for_phase_start(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-		
-		send_bits(base, "s", 0, int_to_bits(tk_sig, 4), tk_mid, cts_tk)
+		_ = send_bits(base, "s", 0, int_to_bits(int(tk_sig), 4), tk_mid, cts_tk)
 		
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 		
-		mut status := u32(0)
-		mut got_status := false
+		mut status := u32(0b1111)
 		for _ in 0 .. 3 {
 			status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { continue }
 			status = bits_to_int(status_bits)
-			if status != 0b1111 {
-				got_status = true
-				break
-			}
+			if status != 0b1111 { break }
 		}
 		
-		if got_status {
-			println('[tx] Receiver status: ${status:04b}')
-			if status == status_ready {
-				println('[tx] Receiver appears to be in handshake mode. Re-acknowledging...')
-				pi_tk_ra := wait_for_phase_start(2, window)
-				cts_tk_ra := pi_tk_ra.cycle_start / 1000
-				tk_mid_ra := pi_tk_ra.cycle_start + pi_tk_ra.t1_len + pi_tk_ra.t2_len + (pi_tk_ra.tk_len / 2)
-				send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ra, cts_tk_ra)
-				resending = true
-				continue
-			}
-			if status == status_stop {
-				println('[tx] Receiver requested stop, but we have more data (${pos}/${data.len}). Retransmitting.')
-				resending = true
-				continue
-			}
-			if status == 0b1111 {
-				println('[tx] No signal from receiver (0b1111).')
-				resending = true
-				continue
-			}
-			if status == status_success || status == status_ok || status == status_start || status == status_success_n || status == status_success_alt {
-				pos = end
-				chunk_idx++
-				resending = false
-				first_success = true
-			} else {
-				println('[tx] Receiver reported error. Will resend.')
-				resending = true
-			}
+		println('[tx] Receiver status: ${status:04b}')
+		mut should_resend := false
+		if status == status_ready {
+			println('[tx] Receiver appears to be in handshake mode. Re-acknowledging...')
+			pi_tk_ra := wait_for_phase_start(2, window)
+			cts_tk_ra := pi_tk_ra.cycle_start / 1000
+			tk_mid_ra := pi_tk_ra.cycle_start + pi_tk_ra.t1_len + pi_tk_ra.t2_len + (pi_tk_ra.tk_len / 2)
+			send_bits(base, "s", 0, int_to_bits(status_start, 4), tk_mid_ra, cts_tk_ra)
+			should_resend = true
+		} else if status == status_stop {
+			println('[tx] Receiver requested stop, but we have more data. Retransmitting.')
+			should_resend = true
+		} else if status == 0b1111 {
+			println('[tx] No signal from receiver.')
+			should_resend = true
+		}
+
+		if should_resend {
+			resending = true
+			continue
+		}
+
+		if status == status_success || status == status_ok || status == status_start || status == status_success_n || status == status_success_alt {
+			pos = end
+			chunk_idx++
+			resending = false
+			first_success = true
 		} else {
-			println('[tx] No status/No signal from receiver.')
-			resending = true 
+			println('[tx] Receiver reported error. Will resend.')
+			resending = true
 		}
 	}
-	
 }
 
 fn rec_mode(base string) {
 	thr := calibrate(base) or { die('calibration failed') }
 	pi_check := get_phase_info(window)
-	// Index (1) + ChunkHash (1 or 0) + Payload (g_chunk_size) + Terminator (2)
 	mut wire_chunk_size := 1 + 1 + g_chunk_size + 2
 	if g_no_hash_check {
 		wire_chunk_size = 1 + g_chunk_size + 2
@@ -803,13 +784,13 @@ fn rec_mode(base string) {
 
 	println('[rx] Sending READY (0111) and waiting for START (1100)...')
 	for {
-		pi := wait_for_phase_start(1, g_hs_window) // Cycle start
+		pi := wait_for_phase_start(1, g_hs_window)
 		cts := pi.cycle_start / 1000
 		t2_start := pi.cycle_start + pi.t1_len
 		t2_third := pi.t2_len / 3
 		ready_time := t2_start + 2 * t2_third
 		for get_ts() < ready_time { time.sleep(100 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi.phase_end, cts)
+		_ = send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi.phase_end, cts)
 		pi_tk := wait_for_phase_start(2, g_hs_window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
@@ -823,16 +804,15 @@ fn rec_mode(base string) {
 			}
 		}
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi_tk.phase_end, cts)
+		_ = send_bits(base, "r", 0, int_to_bits(status_ready, 4), pi_tk.phase_end, cts)
 	}
 
 	for !finished {
-		pi := wait_for_phase_start(1, window) // Wait for T2
+		pi := wait_for_phase_start(1, window)
 		cts := pi.cycle_start / 1000
 		println('[rx] Cycle start, reading chunk...')
 		
 		num_bits := wire_chunk_size * 8
-		
 		mut success := true
 		bits := read_bits(base, "d", 0, num_bits, thr, pi.phase_end, cts) or {
 			println('[!] T2 timeout or read failure')
@@ -847,7 +827,6 @@ fn rec_mode(base string) {
 			}
 			
 			chunk_idx := chunk_full[0]
-
 			mut payload := []u8{}
 			mut chunk_hash := u8(0)
 
@@ -902,6 +881,7 @@ fn rec_mode(base string) {
 					} else {
 						println('[rx] Chunk #${chunk_idx} already accepted, skipping.')
 					}
+				}
 			} else {
 				println('[rx] Invalid chunk terminator: ${terminator:04X}')
 				success = false
@@ -913,17 +893,14 @@ fn rec_mode(base string) {
 		t2_start := pi.cycle_start + pi.t1_len
 		t2_third := pi.t2_len / 3
 		status_report_time := t2_start + 2 * t2_third
-		
 		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
 		
 		status_val := if success { status_success } else { status_error }
-		send_bits(base, "r", 0, int_to_bits(status_val, 4), pi.phase_end, cts)
+		_ = send_bits(base, "r", 0, int_to_bits(status_val, 4), pi.phase_end, cts)
 		
-		// TK window
 		pi_tk := wait_for_phase_start(2, window)
 		cts_tk := pi_tk.cycle_start / 1000
 		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-		
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 		
 		tk_status := if !g_no_hash_check && !hash_received {
@@ -933,7 +910,7 @@ fn rec_mode(base string) {
 		} else {
 			status_error
 		}
-		send_bits(base, "r", 0, int_to_bits(tk_status, 4), pi_tk.phase_end, cts_tk)
+		_ = send_bits(base, "r", 0, int_to_bits(int(tk_status), 4), pi_tk.phase_end, cts_tk)
 		
 		if !success {
 			println('[rx] Error reported. Expecting retransmission.')
@@ -952,7 +929,6 @@ fn rec_mode(base string) {
 	} else {
 		println('[rx] Hash check disabled.')
 	}
-	
 }
 
 fn main() {
