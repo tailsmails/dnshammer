@@ -46,7 +46,6 @@ __global window = 100
 __global g_hs_window = 10
 __global g_chunk_size = 5
 __global g_tk_len = 6
-__global g_manual_size = 0
 __global g_no_hash_check = false
 __global g_fallback_notified = false
 
@@ -608,23 +607,24 @@ fn send_mode(base string, msg string) {
 	thr := calibrate(base) or { die('calibration failed') }
 	
 	mut raw_data, filtered := huffman_encode(msg)
-	h := simple_hash(filtered.bytes())
 	
 	mut data := []u8{}
-	data << h
+	if !g_no_hash_check {
+		h := simple_hash(filtered.bytes())
+		data << h
+		println('[tx] Hash: ${h:02X}')
+	} else {
+		println('[tx] Hash check disabled.')
+	}
 	data << raw_data
 
 	println('[tx] "${msg}" -> "${filtered}" (${filtered.len} chars)')
-	println('[tx] Hash: ${h:02X}')
 	println('[tx] ${data.len} total wire bytes (incl. Hash)')
 	println('[tx] chunk size: ${g_chunk_size}')
 	
 	pi_check := get_phase_info(window)
-	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2 or 0) + StatusWarming (1)
-	mut wire_chunk_size := 1 + 1 + g_chunk_size + 3
-	if g_manual_size > 0 {
-		wire_chunk_size = 1 + 1 + g_chunk_size + 1
-	}
+	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2) + StatusWarming (1)
+	wire_chunk_size := 1 + 1 + g_chunk_size + 3
 	
 	estimated_bits := wire_chunk_size * 8
 	estimated_time := i64(estimated_bits) * 600 // Increased for status bit warming redundancy
@@ -688,14 +688,12 @@ fn send_mode(base string, msg string) {
 		chunk << ch_hash
 		chunk << payload
 		
-		if g_manual_size == 0 {
-			if end < data.len {
-				chunk << u8(magic_chunk_end >> 8)
-				chunk << u8(magic_chunk_end & 0xFF)
-			} else {
-				chunk << u8(magic_eom >> 8)
-				chunk << u8(magic_eom & 0xFF)
-			}
+		if end < data.len {
+			chunk << u8(magic_chunk_end >> 8)
+			chunk << u8(magic_chunk_end & 0xFF)
+		} else {
+			chunk << u8(magic_eom >> 8)
+			chunk << u8(magic_eom & 0xFF)
 		}
 		
 		if resending {
@@ -780,11 +778,8 @@ fn send_mode(base string, msg string) {
 fn rec_mode(base string) {
 	thr := calibrate(base) or { die('calibration failed') }
 	pi_check := get_phase_info(window)
-	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2 or 0)
-	mut wire_chunk_size := 1 + 1 + g_chunk_size + 2
-	if g_manual_size > 0 {
-		wire_chunk_size = 1 + 1 + g_chunk_size
-	}
+	// Index (1) + ChunkHash (1) + Payload (g_chunk_size) + Terminator (2)
+	wire_chunk_size := 1 + 1 + g_chunk_size + 2
 	estimated_bits := wire_chunk_size * 8
 	estimated_time := i64(estimated_bits) * 550
 	if estimated_time > pi_check.t2_len {
@@ -844,44 +839,23 @@ fn rec_mode(base string) {
 			
 			chunk_idx := chunk_full[0]
 			chunk_hash := chunk_full[1]
+			payload := chunk_full[2..wire_chunk_size-2].clone()
+			terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
+			is_eom := is_fuzzy_match(terminator, magic_eom)
+			is_chunk_end := is_fuzzy_match(terminator, magic_chunk_end)
 
-			mut payload := []u8{}
-			mut is_eom := false
-			mut is_chunk_end := false
-
-			if g_manual_size > 0 {
-				payload = chunk_full[2..wire_chunk_size].clone()
-				is_chunk_end = true
-				if final_data.len + (payload.len - (if !hash_received { 1 } else { 0 })) >= g_manual_size {
-					is_eom = true
-				}
-			} else {
-				payload = chunk_full[2..wire_chunk_size-2].clone()
-				terminator := (u16(chunk_full[wire_chunk_size - 2]) << 8) | u16(chunk_full[wire_chunk_size - 1])
-				is_eom = is_fuzzy_match(terminator, magic_eom)
-				is_chunk_end = is_fuzzy_match(terminator, magic_chunk_end)
-				if !is_eom && !is_chunk_end {
-					println('[rx] Invalid chunk terminator: ${terminator:04X}')
-					success = false
-				}
-			}
-
-			if success && (is_chunk_end || is_eom) {
+			if is_chunk_end || is_eom {
 				mut chunk_pre := []u8{}
 				chunk_pre << chunk_idx
 				chunk_pre << payload
 				actual_chunk_hash := simple_hash(chunk_pre)
 
 				if actual_chunk_hash == chunk_hash {
-					if g_manual_size > 0 {
-						println('[rx] Chunk #${chunk_idx} valid (hash OK)')
-					} else {
-						println('[rx] Chunk #${chunk_idx} valid (terminator OK, hash OK)')
-					}
+					println('[rx] Chunk #${chunk_idx} valid (terminator: ${terminator:04X}, hash OK)')
 					
 					if int(chunk_idx) > last_accepted_idx {
 						mut chunk_data := payload.clone()
-						if !hash_received {
+						if !g_no_hash_check && !hash_received {
 							expected_hash = chunk_data[0]
 							chunk_data = chunk_data[1..].clone()
 							hash_received = true
@@ -890,12 +864,6 @@ fn rec_mode(base string) {
 
 						if is_eom {
 							finished = true
-							if g_manual_size > 0 {
-								needed := g_manual_size - final_data.len
-								if needed < chunk_data.len {
-									chunk_data = chunk_data[..needed].clone()
-								}
-							}
 						}
 						
 						final_data << chunk_data
@@ -908,6 +876,9 @@ fn rec_mode(base string) {
 					println('[rx] Chunk hash mismatch! Expected: ${chunk_hash:02X}, Actual: ${actual_chunk_hash:02X}')
 					success = false
 				}
+			} else {
+				println('[rx] Invalid chunk terminator: ${terminator:04X}')
+				success = false
 			}
 		} else {
 			success = false
@@ -929,7 +900,7 @@ fn rec_mode(base string) {
 		
 		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
 		
-		tk_status := if !hash_received {
+		tk_status := if !g_no_hash_check && !hash_received {
 			status_ready
 		} else if success {
 			if rand.intn(2) or { 0 } == 0 { status_success_n } else { status_success_alt }
@@ -985,9 +956,6 @@ fn main() {
 			g_tk_len = os.args[i + 1].int()
 			if g_tk_len < 1 { g_tk_len = 1 }
 			i += 2
-		} else if os.args[i] == '--size' && i + 1 < os.args.len {
-			g_manual_size = os.args[i + 1].int()
-			i += 2
 		} else if os.args[i] == '--no-hash-check' {
 			g_no_hash_check = true
 			i += 1
@@ -1000,7 +968,7 @@ fn main() {
 	if g_dns.len > 0 { println('[*] dns server: ${g_dns}') }
 
 	if args.len < 1 {
-		eprintln('dnsh [--dns SERVER] [--workers N] [--window SEC] [--chunk-size N] [--tk-len N] [--size N] [--no-hash-check] <send|rec> [domain] [msg]')
+		eprintln('dnsh [--dns SERVER] [--workers N] [--window SEC] [--chunk-size N] [--tk-len N] [--no-hash-check] <send|rec> [domain] [msg]')
 		eprintln('  sudo ./dnsh --dns 8.8.8.8 send x.com "hello world"')
 		eprintln('  sudo ./dnsh --dns 8.8.8.8 rec  x.com')
 		exit(1)
