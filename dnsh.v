@@ -744,8 +744,9 @@ fn send_mode(base string, msg string) {
 				continue
 			}
 			if status == status_stop {
-				println('[tx] Receiver requested stop. Confirming.')
-				break
+				println('[tx] Receiver requested stop, but we have more data (${pos}/${data.len}). Retransmitting.')
+				resending = true
+				continue
 			}
 			if status == 0b1111 {
 				println('[tx] No signal from receiver (0b1111).')
@@ -767,29 +768,6 @@ fn send_mode(base string, msg string) {
 		}
 	}
 	
-	println('[tx] Entering final termination handshake...')
-	for attempt in 0 .. 10 {
-		println('[tx] Termination handshake attempt #${attempt+1}...')
-		pi_tk := wait_for_phase_start(2, window)
-		cts_tk := pi_tk.cycle_start / 1000
-		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-		
-		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
-		status_bits := read_bits(base, "r", 0, 4, thr, pi_tk.phase_end, cts_tk) or { []u8{} }
-		if status_bits.len == 4 {
-			status := bits_to_int(status_bits)
-			if status == status_stop {
-				println('[tx] Received STOP. Sending CONFIRM.')
-				pi_tk_next := wait_for_phase_start(2, window)
-				cts_tk_next := pi_tk_next.cycle_start / 1000
-				tk_mid_next := pi_tk_next.cycle_start + pi_tk_next.t1_len + pi_tk_next.t2_len + (pi_tk_next.tk_len / 2)
-				send_bits(base, "s", 0, int_to_bits(status_confirm_stop, 4), tk_mid_next, cts_tk_next)
-				println('[tx] Termination confirmed. Done.')
-				return
-			}
-		}
-		time.sleep(500 * time.millisecond)
-	}
 }
 
 fn rec_mode(base string) {
@@ -940,34 +918,6 @@ fn rec_mode(base string) {
 		println('[rx] Hash verified successfully.')
 	}
 	
-	println('[rx] Entering termination handshake...')
-	for _ in 0 .. 5 {
-		pi := wait_for_phase_start(1, window)
-		cts := pi.cycle_start / 1000
-		
-		t2_start := pi.cycle_start + pi.t1_len
-		t2_third := pi.t2_len / 3
-		status_report_time := t2_start + 2 * t2_third
-		for get_ts() < status_report_time { time.sleep(100 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi.phase_end, cts)
-		
-		// TK window
-		pi_tk := wait_for_phase_start(2, window)
-		cts_tk := pi_tk.cycle_start / 1000
-		tk_mid := pi_tk.cycle_start + pi_tk.t1_len + pi_tk.t2_len + (pi_tk.tk_len / 2)
-		
-		conf_bits := read_bits(base, "s", 0, 4, thr, tk_mid, cts_tk) or { []u8{} }
-		if conf_bits.len == 4 {
-			conf_val := bits_to_int(conf_bits)
-			if conf_val == status_confirm_stop {
-				println('[rx] Sender confirmed stop. Terminating.')
-				break
-			}
-		}
-		
-		for get_ts() < tk_mid { time.sleep(50 * time.millisecond) }
-		send_bits(base, "r", 0, int_to_bits(status_stop, 4), pi_tk.phase_end, cts_tk)
-	}
 }
 
 fn main() {
