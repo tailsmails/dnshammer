@@ -3,6 +3,8 @@ module main
 import os
 import time
 import rand
+import crypto.argon2
+import crypto.sha3
 
 #include <netdb.h>
 #include <sys/socket.h>
@@ -47,7 +49,7 @@ __global g_hs_window = 10
 __global g_chunk_size = 5
 __global g_tk_len = 6
 __global g_fallback_notified = false
-__global g_seed = u64(0)
+__global g_seed = []u8{}
 
 const status_success = 0b1110
 const status_success_n = 0b1100
@@ -57,7 +59,7 @@ const status_ok = 0b1000
 const status_start = 0b0100
 const status_ready = 0b0011
 const status_stop = 0b0010
-const status_confirm_stop = 0b1101
+// const status_confirm_stop = 0b1101
 
 fn get_ts() i64 {
 	return time.now().unix_milli()
@@ -72,36 +74,42 @@ struct PhaseInfo {
 	tk_len      i64
 }
 
-fn generate_secure_label(seed u64, prefix string, idx int, variant int, cts i64) string {
-	mut hash := u64(14695981039346656037)
-	prime := u64(1099511628211)
-	
-	hash ^= seed
-	hash *= prime
-	
-	hash ^= u64(cts)
-	hash *= prime
-	
-	for b in prefix.bytes() {
-		hash ^= u64(b)
-		hash *= prime
+fn generate_secure_label(seed []u8, prefix string, idx int, variant int, cts i64) string {
+	mut buf := []u8{cap: 128}
+	for b in seed {
+		buf << b
 	}
-	
-	hash ^= u64(idx)
-	hash *= prime
-	
-	hash ^= u64(variant)
-	hash *= prime
-	
+	buf << u8(cts >> 56)
+	buf << u8(cts >> 48)
+	buf << u8(cts >> 40)
+	buf << u8(cts >> 32)
+	buf << u8(cts >> 24)
+	buf << u8(cts >> 16)
+	buf << u8(cts >> 8)
+	buf << u8(cts)
+	for b in prefix.bytes() {
+		buf << b
+	}
+	buf << u8(idx >> 24)
+	buf << u8(idx >> 16)
+	buf << u8(idx >> 8)
+	buf << u8(idx)
+	buf << u8(variant >> 24)
+	buf << u8(variant >> 16)
+	buf << u8(variant >> 8)
+	buf << u8(variant)
+	hash_bytes := sha3.sum512(buf)
 	chars := 'abcdefghijklmnopqrstuvwxyz0123456789'
-	mut state := hash
 	mut label := ''
+	mut state := u64(0)
+	for i in 0 .. 8 {
+		state = (state << 8) | u64(hash_bytes[i])
+	}
 	for _ in 0 .. 8 {
 		char_idx := int(state % u32(chars.len))
-		label += chars[char_idx..char_idx+1]
+		label += chars[char_idx..char_idx + 1]
 		state /= u32(chars.len)
 	}
-	
 	return label
 }
 
@@ -522,7 +530,7 @@ fn die(s string) {
 	exit(1)
 }
 
-fn send_bit_task(base string, prefix string, idx int, cts i64, seed u64) {
+fn send_bit_task(base string, prefix string, idx int, cts i64, seed []u8) {
 	label1 := generate_secure_label(seed, prefix, idx, 0, cts)
 	label2 := generate_secure_label(seed, prefix, idx, 1, cts)
 	label3 := generate_secure_label(seed, prefix, idx, 2, cts)
@@ -556,7 +564,7 @@ struct BitResult {
 	bit u8
 }
 
-fn read_bit_worker(base string, prefix string, idx int, thr i64, cts i64, seed u64) BitResult {
+fn read_bit_worker(base string, prefix string, idx int, thr i64, cts i64, seed []u8) BitResult {
 	label1 := generate_secure_label(seed, prefix, idx, 0, cts)
 	label2 := generate_secure_label(seed, prefix, idx, 1, cts)
 	label3 := generate_secure_label(seed, prefix, idx, 2, cts)
@@ -573,14 +581,11 @@ fn read_bit_worker(base string, prefix string, idx int, thr i64, cts i64, seed u
 	return BitResult{idx: idx, bit: val}
 }
 
-fn derive_seed_from_password(password string) u64 {
-	mut hash := u64(14695981039346656037)
-	prime := u64(1099511628211)
-	for b in password.bytes() {
-		hash ^= u64(b)
-		hash *= prime
+fn derive_seed_from_password(password string) []u8 {
+	salt := 'dnshammer_salt16'.bytes()
+	return argon2.id_key(password.bytes(), salt, 1, 4096, 1, 32) or {
+		panic('Argon2 derivation failed: ' + err.msg())
 	}
-	return hash
 }
 
 fn read_bits(base string, prefix string, start_idx int, num_bits int, thr i64, deadline i64, cts i64) ![]u8 {
