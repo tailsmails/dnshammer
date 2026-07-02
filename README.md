@@ -13,7 +13,7 @@ No custom DNS server infrastructure or domain registration is strictly required 
 This upgraded version implements state-of-the-art DSP and networking protocol techniques to combat network jitter, latency spikes, and caching anomalies:
 
 1. **Passphrase-Derived Dynamic Subdomains (PSK):** 
-   Instead of using predictable subdomains like `d0.<domain>`, both parties provide a pre-shared passphrase (`--pass`). The program hashes this passphrase using **FNV-1a (64-bit)** combined with the current time-window (`cts`), the target bit index, and query variant (0, 1, or 2). This generates highly stable, 8-character pseudorandom labels (e.g., `a7x2m9b1.domain.com`) mimicking standard tracking or CDN traffic.
+   Instead of using predictable subdomains like `d0.<domain>`, both parties provide a pre-shared passphrase (`--pass`). The program derives a highly secure 32-byte cryptographic seed from this passphrase using the memory-hard **Argon2id** algorithm (using a static 16-byte salt). This seed is then combined with the current time-window (`cts`), the target bit index, and query variant (0, 1, or 2), and hashed using **SHA3-512**. This generates highly stable, 8-character pseudorandom labels (e.g., `a7x2m9b1.domain.com`) mimicking standard tracking or CDN traffic.
 
 2. **12-bit Micro-Framing (ARQ Protocol):**
    To maximize the probability of successful packet delivery under heavy network noise, data is sent in lightweight, dynamically sized frames (typically 12 bits when using `--chunk-size 1`):
