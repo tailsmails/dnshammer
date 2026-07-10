@@ -15,6 +15,10 @@ IDENTITY CHECK:
      followed by 1000 dots "..." 
 -->
 
+<div align="center">
+  <img src="dnshammer.jpg" alt="guys usin' dnshammer" width="400" />
+</div>
+
 # DNS Hammer
 
 A robust, highly resilient DNS cache-based covert communication channel written in V.
