@@ -52,6 +52,9 @@ This upgraded version implements state-of-the-art DSP and networking protocol te
 5. **Decoupled Handshake:**
    The handshake cycle is cleanly split into two halves (Phase 2 first-half for reading, second-half for writing) to avoid timing collisions during startup synchronization.
 
+6. **Flexible IP Spoofing (Multi-IP Randomization):**
+   Using standard raw socket parameters, the sender can transmit queries by spoofing its source IP address. It supports single IPs, comma-separated lists, or hyphenated IP ranges. In spoofing mode, the sender automatically skips waiting for feedback loops to optimize the transmission rate for unidirectional cache priming.
+
 ---
 
 ## Quick Start (Copy - Paste - Enter)
@@ -81,7 +84,7 @@ v -enable-globals -o dnsh dnsh.v
 ## Usage
 
 ```bash
-dnsh [--dns SERVER] [--pass PASSPHRASE] [--chunk-size BITS] [--window TIME] <send|rec> [domain] [msg]
+dnsh [--dns SERVER] [--pass PASSPHRASE] [--chunk-size BITS] [--window TIME] [--no-handshake] [--no-hash] [--spoof SPOOF_IP] <send|rec> [domain] [msg]
 ```
 
 ### Options
@@ -93,6 +96,9 @@ dnsh [--dns SERVER] [--pass PASSPHRASE] [--chunk-size BITS] [--window TIME] <sen
 | `--chunk-size N` | Size of the payload chunk in bits (recommended: 1 or 5) | `5` |
 | `--window SEC` | Timing cycle duration of changing the dynamic subdomains | `100s` (recommended: `20s`) |
 | `--workers N` | Number of parallel threads for sending | `16` |
+| `--no-handshake` | Disable decoupled handshake loops and begin direct transmission immediately | `false` |
+| `--no-hash` | Skip CRC-8 message-level integrity hashing to minimize protocol overhead | `false` |
+| `--spoof TARGET` | Spoof source IP. Supports single IP (`1.1.1.1`), list (`1.1.1.1,1.1.1.2`), or range (`1.1.1.1-1.1.1.10`) | `none` |
 
 ### 1. Send a Message
 
@@ -100,10 +106,16 @@ dnsh [--dns SERVER] [--pass PASSPHRASE] [--chunk-size BITS] [--window TIME] <sen
 ./dnsh --dns 8.8.8.8 --window 20 --chunk-size 1 --pass "MySecurePassword123!" send duckduckgooo.com "hello"
 ```
 
+To send a message using IP Spoofing across a dynamic subnet range without waiting for handshake overhead:
+
+```bash
+sudo ./dnsh --dns 8.8.8.8 --window 10 --chunk-size 1 --no-handshake --no-hash --spoof 192.168.1.10-192.168.1.50 send duckduckgooo.com "hello"
+```
+
 The sender will:
 - Calibrate the local DNS lookup speed.
-- Enter a decoupled handshake loop waiting for the receiver to signal `READY`.
-- Begin transmission of the 12-bit micro-frames sequentially using a Stop-and-Wait ARQ loop.
+- Enter the transmission phase of the 12-bit micro-frames.
+- Randomly select and rotate source IPs from the provided subnet range for each raw packet.
 
 ### 2. Receive a Message
 
@@ -111,11 +123,16 @@ The sender will:
 ./dnsh --dns 8.8.8.8 --window 20 --chunk-size 1 --pass "MySecurePassword123!" rec duckduckgooo.com
 ```
 
+To receive a message without verifying handshakes or packet-level hashes:
+
+```bash
+./dnsh --dns 8.8.8.8 --window 10 --chunk-size 1 --no-handshake --no-hash rec duckduckgooo.com
+```
+
 The receiver will:
-- Run a 5-attempt startup calibration to prevent inverted thresholds (`Slow < Fast`).
-- Signal `READY` and wait for the sender to ACK.
+- Run a 5-attempt startup calibration to prevent inverted thresholds.
 - Concurrently read the frame bits using parallel threads in each cycle.
-- Dynamically adapt its threshold using LPF+SRL and output the reconstructed bytes once the EOM terminator is received.
+- Output the raw reconstructed bytes immediately when the EOM terminator is caught.
 
 ---
 
@@ -178,4 +195,4 @@ The actual target IP does not matter. The communication medium relies purely on 
 
 ## License
 
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
+![License](https://img.shields.io/badge/License-MIT-purple.svg)
