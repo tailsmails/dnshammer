@@ -178,4 +178,4 @@ The actual target IP does not matter. The communication medium relies purely on 
 
 ## License
 
-![License](https://img.shields.io/badge/License-MIT-purple.svg)
+![License](https://img.shields.io/badge/License-EUPL1.2-purple.svg)
