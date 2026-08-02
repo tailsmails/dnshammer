@@ -8,9 +8,6 @@ on:
 permissions:
   contents: write
 
-env:
-  BINARY_NAME: dnshammer
-
 jobs:
   release:
     runs-on: ${{ matrix.runner }}
@@ -21,19 +18,19 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-latest
-            build_cmd: v -prod -cflags "-static" -os linux -arch amd64 -o ${{ env.BINARY_NAME }}-linux-amd64 .
+            build_cmd: v -prod -cflags "-static" -os linux -arch amd64 -o dnshammer-linux-amd64 .
 
           - arch: arm64
             runner: ubuntu-22.04-arm
             build_cmd: |
               sudo apt-get update && sudo apt-get install -y musl-tools
-              CC=musl-gcc v -prod -cflags "-static" -os linux -arch arm64 -o ${{ env.BINARY_NAME }}-linux-arm64 .
+              CC=musl-gcc v -prod -cflags "-static" -os linux -arch arm64 -o dnshammer-linux-arm64 .
 
           - arch: armv7
             runner: ubuntu-latest
             build_cmd: |
               sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
-              CC=arm-linux-gnueabihf-gcc v -prod -cflags "-static" -os linux -arch arm -o ${{ env.BINARY_NAME }}-linux-armv7 .
+              CC=arm-linux-gnueabihf-gcc v -prod -cflags "-static" -os linux -arch arm -o dnshammer-linux-armv7 .
 
     steps:
       - name: Checkout
@@ -52,7 +49,7 @@ jobs:
         with:
           tag: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
-          artifacts: ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}
+          artifacts: dnshammer-linux-${{ matrix.arch }}
           generateReleaseNotes: true
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
