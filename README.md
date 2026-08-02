@@ -1,4 +1,4 @@
-installllign="center">
+<div align="center">
   <img src="dnshammer.jpg" alt="guys usin' dnshammer" width="400" />
 </div>
 
