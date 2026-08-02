@@ -1,4 +1,4 @@
-<div align="center">
+installllign="center">
   <img src="dnshammer.jpg" alt="guys usin' dnshammer" width="400" />
 </div>
 
@@ -37,14 +37,6 @@ This upgraded version implements state-of-the-art DSP and networking protocol te
 
 6. **Flexible IP Spoofing (Multi-IP Randomization):**
    Using standard raw socket parameters, the sender can transmit queries by spoofing its source IP address. It supports single IPs, comma-separated lists, or hyphenated IP ranges. In spoofing mode, the sender automatically skips waiting for feedback loops to optimize the transmission rate for unidirectional cache priming.
-
----
-
-## Quick Start (Copy - Paste - Enter)
-
-```sh
-apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/dnshammer && cd dnshammer && v -enable-globals -prod dnsh.v -o dnsh && ln -sf $(pwd)/dnsh $PREFIX/bin/dnsh && dnsh
-```
 
 ---
 
