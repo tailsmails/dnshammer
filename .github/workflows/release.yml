@@ -18,8 +18,7 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-latest
-            build_cmd: v -enable-globals -prod -cflags "-static" -os linux -arch amd64 -o dnshammer-linux-amd64 .
-            run: ./dnshammer
+            build_cmd: v -enable-globals -prod -cflags "-static" -os linux -arch amd64 -o dnshammer-linux-amd64 run .
             
     steps:
       - name: Checkout
