@@ -8,18 +8,41 @@ on:
 permissions:
   contents: write
 
+env:
+  APP_NAME: dnshammer
+
 jobs:
   release:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            runner: ubuntu-latest
-            build_cmd: v -enable-globals -prod -cflags "-static" -os linux -arch amd64 -o dnshammer-linux-amd64 .
-            
+          - target: linux-amd64
+            setup_cmd: sudo apt-get update && sudo apt-get install -y musl-tools
+            build_cmd: v -enable-globals -prod -cc musl-gcc -cflags "-static" -os linux -arch amd64 -o $APP_NAME-linux-amd64 .
+            artifact_suffix: -linux-amd64
+
+          - target: linux-arm64
+            setup_cmd: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+            build_cmd: v -enable-globals -prod -cc aarch64-linux-gnu-gcc -os linux -arch arm64 -o $APP_NAME-linux-arm64 .
+            artifact_suffix: -linux-arm64
+
+          - target: android-arm64
+            setup_cmd: ""
+            build_cmd: |
+              v -enable-globals -prod -os android -o $APP_NAME.c .
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm64
+            artifact_suffix: -android-arm64
+
+          - target: android-arm
+            setup_cmd: ""
+            build_cmd: |
+              v -enable-globals -prod -os android -o $APP_NAME.c .
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm
+            artifact_suffix: -android-arm
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,6 +52,10 @@ jobs:
         with:
           check-latest: true
 
+      - name: Setup Compiler Dependencies
+        if: matrix.setup_cmd != ''
+        run: ${{ matrix.setup_cmd }}
+
       - name: Build binary
         run: ${{ matrix.build_cmd }}
 
@@ -37,7 +64,7 @@ jobs:
         with:
           tag: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
-          artifacts: dnshammer-linux-${{ matrix.arch }}
+          artifacts: ${{ env.APP_NAME }}${{ matrix.artifact_suffix }}
           generateReleaseNotes: true
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
