@@ -40,8 +40,8 @@ jobs:
         with:
           check-latest: true
 
-      - name: Build binary
-        run: v -enable-globals -prod -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} .
+      - name: Build binary (static)
+        run: v -prod -enable-globals -cflags "-static" -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} .
 
       - name: Upload to Release
         uses: ncipollo/release-action@v1
