@@ -22,7 +22,7 @@ jobs:
           check-latest: true
 
       - name: Build binary
-        run: v -prod -o ${{ github.event.inputs.binary_name }} ./dnshammer.v
+        run: v -prod -o ${{ github.event.inputs.binary_name }} ./dnsh.v
 
       - name: Create Release + Upload Binary
         uses: ncipollo/release-action@v1
