@@ -31,19 +31,9 @@ jobs:
             runner: ubuntu-latest
             v_arch: arm
 
-          - arch: 386
-            runner: ubuntu-latest
-            v_arch: 386
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install dependencies
-        if: matrix.arch == '386'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-multilib
 
       - name: Install V
         uses: vlang/setup-v@v1
@@ -51,7 +41,7 @@ jobs:
           check-latest: true
 
       - name: Build binary
-        run: v -enable-globals -prod -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} .
+        run: v -prod -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} .
 
       - name: Upload to Release
         uses: ncipollo/release-action@v1
