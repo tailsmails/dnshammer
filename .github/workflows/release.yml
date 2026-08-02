@@ -16,6 +16,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -26,17 +27,14 @@ jobs:
             runner: ubuntu-22.04-arm
             v_arch: arm64
 
-          - arch: armv7
-            runner: ubuntu-latest
-            v_arch: arm
-
-          - arch: 386
-            runner: ubuntu-latest
-            v_arch: 386
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib
 
       - name: Install V
         uses: vlang/setup-v@v1
