@@ -1,16 +1,34 @@
 name: Create Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      binary_name:
-        description: 'dnshammer'
-        required: true
-        default: 'dnshammer'
+  push:
+    branches: [ main, master ]
+
+env:
+  BINARY_NAME: dnshammer
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            v_arch: amd64
+
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            v_arch: arm64
+
+          - arch: armv7
+            runner: ubuntu-latest
+            v_arch: arm
+
+          - arch: 386
+            runner: ubuntu-latest
+            v_arch: 386
 
     steps:
       - name: Checkout
@@ -22,13 +40,14 @@ jobs:
           check-latest: true
 
       - name: Build binary
-        run: v -prod -o ${{ github.event.inputs.binary_name }} ./dnsh.v
+        run: v -prod -enable-globals -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} ./dnsh.v
 
-      - name: Create Release + Upload Binary
+linux name: Upload to Release
         uses: ncipollo/release-action@v1
         with:
-          tag: release-${{ github.run_number }}
-          name: Release ${{ github.run_number }}
-          artifacts: ${{ github.event.inputs.binary_name }}
+          tag: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          artifacts: ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}
           generateReleaseNotes: true
+          allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
