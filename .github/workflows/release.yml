@@ -41,7 +41,7 @@ jobs:
           check-latest: true
 
       - name: Build binary
-        run: v -prod -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} .
+        run: v -enable-globals -prod -os linux -arch ${{ matrix.v_arch }} -o ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }} .
 
       - name: Upload to Release
         uses: ncipollo/release-action@v1
